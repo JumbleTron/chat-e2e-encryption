@@ -16,12 +16,14 @@
     "build": "npm --prefix client run build",
     "check": "node --check server/index.js && node --check server/db.js && npm run build",
     "test:integration": "npm --prefix server run test:integration",
+    "test:mls": "npm --prefix client run test:mls",
     "docker:up": "docker compose up -d --build",
     "docker:infra": "docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d mysql",
     "docker:down": "docker compose down",
     "docker:logs": "docker compose logs -f"
   },
   "devDependencies": {
-    "concurrently": "^9.1.2"
+    "concurrently": "^9.1.2",
+    "playwright-core": "^1.61.1"
   }
 }

@@ -6,7 +6,7 @@ import DevicesModal from './components/DevicesModal';
 import InviteMembersModal from './components/InviteMembersModal';
 import { useChat } from './hooks/useChat';
 import { loadSession, clearSession } from './crypto';
-import { migrateLegacySession } from './devices';
+import { closeMls } from './mls/client';
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -25,10 +25,8 @@ export default function App() {
       setRestoringSession(false);
       return;
     }
-    migrateLegacySession(session)
-      .then(setUser)
-      .catch(() => clearSession())
-      .finally(() => setRestoringSession(false));
+    setUser(session);
+    setRestoringSession(false);
   }, []);
 
   useEffect(() => {
@@ -36,7 +34,8 @@ export default function App() {
     chat.refreshRooms();
   }, [user]);
 
-  function handleLogout() {
+  async function handleLogout() {
+    await closeMls();
     clearSession();
     setUser(null);
   }
@@ -90,6 +89,7 @@ export default function App() {
             </div>
 
             <div className="sidebar-footer">
+              {chat.securityError && <p className="error">{chat.securityError}</p>}
               <p>🌐 Online globalnie: {chat.globalOnline.length}</p>
             </div>
           </aside>
@@ -125,11 +125,10 @@ export default function App() {
         <CreateRoomModal
           user={user}
           onClose={() => setShowCreateRoom(false)}
-          onCreated={(roomId, groupKey) => {
+          onCreated={async (roomId) => {
             setShowCreateRoom(false);
-            chat.setGroupKey(groupKey);
-            chat.refreshRooms();
-            chat.joinRoom(roomId);
+            await chat.refreshRooms();
+            await chat.joinRoom(roomId);
           }}
         />
       )}

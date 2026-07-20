@@ -1,8 +1,5 @@
 import { useEffect, useState } from 'react';
 import { apiFetch } from '../api';
-import {
-  generateGroupKey, exportGroupKey, saveRoomGroupKey,
-} from '../crypto';
 import { createRoom } from '../hooks/useChat';
 
 export default function CreateRoomModal({ user, onClose, onCreated }) {
@@ -32,16 +29,12 @@ export default function CreateRoomModal({ user, onClose, onCreated }) {
     setLoading(true);
     setError('');
     try {
-      const groupKey = await generateGroupKey();
-      const groupKeyBase64 = await exportGroupKey(groupKey);
       const currentUser = allUsers.find((item) => item.id === user.id) || {
-        id: user.id,
-        devices: [{ id: user.deviceId, publicKey: user.publicKey }],
+        id: user.id, mlsUserId: user.mlsUserId,
       };
       const members = [currentUser, ...allUsers.filter((item) => item.id !== user.id && selected.has(item.id))];
-      const room = await createRoom(name.trim(), members, groupKeyBase64);
-      saveRoomGroupKey(room.id, groupKeyBase64, 1);
-      onCreated(room.id, groupKey);
+      const room = await createRoom(name.trim(), members);
+      onCreated(room.id);
     } catch (createError) {
       setError(createError.message);
     } finally {
@@ -53,7 +46,7 @@ export default function CreateRoomModal({ user, onClose, onCreated }) {
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" onClick={(event) => event.stopPropagation()}>
         <h2>Nowy pokój czatu</h2>
-        <p className="modal-desc">Klucz zostanie zaszyfrowany osobno dla każdego urządzenia członków.</p>
+        <p className="modal-desc">MLS utworzy osobne członkostwo dla każdego aktywnego urządzenia.</p>
         <form onSubmit={handleCreate}>
           <input
             type="text" placeholder="Nazwa pokoju" value={name}
@@ -65,7 +58,7 @@ export default function CreateRoomModal({ user, onClose, onCreated }) {
               <input
                 type="checkbox" checked={selected.has(item.id)}
                 onChange={() => toggleUser(item.id)}
-                disabled={item.devices.length === 0}
+                disabled={item.devices.length === 0 || !item.mlsUserId}
               />
               <span>{item.username}</span>
               <small>{item.devices.length} urz.</small>

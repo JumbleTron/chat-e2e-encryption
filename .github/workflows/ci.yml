@@ -77,6 +77,17 @@ jobs:
           TEST_ORIGIN: http://127.0.0.1:3001
         run: npm run test:integration
 
+      - name: Start frontend preview
+        run: npm --prefix client run preview -- --host 127.0.0.1 --port 4173 > /tmp/message-app-client.log 2>&1 &
+
+      - name: MLS browser test
+        env:
+          TEST_ORIGIN: http://127.0.0.1:4173
+          CHROME_PATH: /usr/bin/google-chrome
+        run: npm run test:mls
+
       - name: Backend logs on failure
         if: failure()
-        run: cat /tmp/message-app-server.log || true
+        run: |
+          cat /tmp/message-app-server.log || true
+          cat /tmp/message-app-client.log || true

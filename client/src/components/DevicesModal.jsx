@@ -46,7 +46,7 @@ export default function DevicesModal({ currentDeviceId, onClose, onKeysRotated }
   }
 
   async function revoke(device) {
-    if (!window.confirm(`Usunąć dostęp urządzenia „${device.name}”? Klucze pokojów zostaną zmienione.`)) return;
+    if (!window.confirm(`Usunąć dostęp urządzenia „${device.name}”? MLS utworzy nowe epoki pokojów.`)) return;
     setBusyId(device.id);
     setError('');
     try {
@@ -122,7 +122,7 @@ export default function DevicesModal({ currentDeviceId, onClose, onKeysRotated }
             <code>{recoveryCode}</code>
             <p>Przechowuj go poza aplikacją. Nie będzie ponownie wyświetlony.</p>
           </div> : <button className="backup-button" onClick={createBackup} disabled={busyId === 'backup'}>
-            Utwórz zaszyfrowaną kopię kluczy
+            Utwórz kopię tożsamości konta
           </button>}
         </section>
         {error && <p className="error">{error}</p>}

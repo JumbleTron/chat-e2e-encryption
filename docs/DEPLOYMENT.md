@@ -11,7 +11,7 @@
 3. Umieść stos za terminatorem TLS albo rozszerz Nginx o certyfikat.
 4. Nie publikuj portu MySQL i nie używaj `docker-compose.dev.yml` na serwerze.
 5. Skonfiguruj zaszyfrowane backupy wolumenu i przetestuj restore.
-6. Włącz centralne logi bez payloadów wiadomości, tokenów i kluczy.
+6. Włącz centralne logi bez payloadów kopert MLS, tokenów i KeyPackage.
 7. Dodaj rate limiting na rejestrację, parowanie i restore.
 8. Przeprowadź audyt aplikacji i konfiguracji hosta.
 
@@ -45,11 +45,12 @@ Aktualna konfiguracja `mysql2` nie wymusza certyfikatu CA. Dla zdalnego MySQL na
 - opóźnienie i liczbę błędów API,
 - wykorzystanie puli MySQL,
 - liczbę reconnectów Socket.IO,
-- pokoje pozostające w `rotation_required`,
+- konflikty Commit zwracające `EpochOccupied`,
+- wielkość puli niewykorzystanych KeyPackage,
 - wygasłe `device_link_requests`,
-- rozmiar `messages` i `recovery_backups`,
+- rozmiar `mls_envelopes` i `recovery_backups`,
 - powodzenie backupu i okresowego testu restore.
 
 ## Incydent
 
-Kompromitacja backendu lub MySQL wymaga rotacji tokenów urządzeń i przeglądu metadanych. Kompromitacja origin frontendu jest poważniejsza: złośliwy JavaScript może użyć kluczy Web Crypto na aktywnych urządzeniach. W takim przypadku należy zatrzymać dystrybucję, przywrócić zaufany frontend, wycofać urządzenia i obrócić klucze pokojów.
+Kompromitacja backendu lub MySQL wymaga rotacji tokenów urządzeń i przeglądu metadanych. Kompromitacja origin frontendu jest poważniejsza: złośliwy JavaScript może użyć aktywnego klienta MLS. W takim przypadku należy zatrzymać dystrybucję, przywrócić zaufany frontend, wycofać urządzenia i wymusić nowe Commity MLS.

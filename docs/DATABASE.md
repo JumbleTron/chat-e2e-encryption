@@ -1,81 +1,59 @@
-# MySQL
-
-## Wymagania
-
-- MySQL 8.4 lub zgodny MySQL 8.x,
-- silnik InnoDB,
-- `utf8mb4` oraz kolacja niewrażliwa na wielkość liter dla nazw użytkowników,
-- osobny użytkownik bazy z dostępem wyłącznie do schematu aplikacji.
-
-Backend tworzy brakujące tabele idempotentnie podczas startu. Kontener MySQL tworzy samą bazę i użytkownika na podstawie zmiennych `MYSQL_*`.
+# Model danych MySQL
 
 ## Relacje
 
 ```text
 users 1---N user_devices
-users N---N rooms           przez room_members
-rooms 1---N messages
-messages 1---N message_reads
-rooms N---N user_devices    przez room_device_keys + key_epoch
-users 1---0..1 recovery_backups
-user_devices 1---0..1 device_link_requests
+users N---N rooms                 przez room_members
+users N---N rooms                 przez room_pending_members do czasu Welcome
+users 1---1 mls_user_profiles
+user_devices 1---1 mls_device_profiles
+user_devices 1---N mls_key_packages
+rooms 1---1 mls_conversations
+mls_conversations 1---N mls_envelopes
+mls_envelopes 1---N mls_envelope_recipients
 ```
 
-## Tabele
+## Tabele aplikacyjne
 
-### `users`
+`users` i `user_devices` przechowują nazwę konta, sesje, status urządzenia i publiczny klucz RSA używany wyłącznie przy bootstrapie nowego urządzenia. Token uwierzytelniający jest przechowywany jako SHA-256.
 
-Logiczne konto. `public_key` jest zachowane dla zgodności z pierwszym urządzeniem; operacje wielourządzeniowe korzystają z `user_devices.public_key`.
+`rooms` oraz `room_members` opisują autoryzację aplikacyjną. `room_pending_members` przechowuje zaproszenie do chwili zapisania adresowanego Welcome; dopiero wtedy użytkownik zostaje aktywnym członkiem. `current_epoch` jest kopią pomocniczą najwyższej zapisanej epoki Commit, a nie sekretem kryptograficznym.
 
-### `user_devices`
+## Tabele MLS
 
-Jednostka uwierzytelniania i dystrybucji kluczy. `auth_token_hash` zawiera SHA-256 losowego tokenu, a `status` kontroluje możliwość logowania i otrzymywania nowych kluczy.
+### `mls_user_profiles`
 
-### `rooms` i `room_members`
+Wiąże konto aplikacyjne ze stabilnym identyfikatorem użytkownika MLS. Raz ustawionego identyfikatora nie można zmienić przez inną sesję.
 
-`rooms.current_epoch` wskazuje aktywny AES. `rotation_required` blokuje wysyłanie, jeśli wycofanie urządzenia nie zostało jeszcze domknięte. `room_members` przechowuje członkostwo użytkownika, nie urządzenia.
+### `mls_device_profiles`
 
-### `room_device_keys`
+Wiąże uwierzytelnioną sesję z identyfikatorem urządzenia umieszczanym w kopertach MLS. Backend odrzuca niezgodnego nadawcę.
 
-Zawiera zaszyfrowaną RSA kopię AES dla konkretnego pokoju, urządzenia i epoki. Klucz główny `(room_id, device_id, key_epoch)` zapobiega duplikatom.
+### `mls_key_packages`
 
-### `messages`
+Przechowuje publiczne KeyPackage. Pakiet zwykły jest atomowo oznaczany jako wykorzystany podczas pobrania. Pakiet last-resort może być pobierany ponownie.
 
-Przechowuje ciphertext AES-GCM, IV, epokę i uwierzytelnione urządzenie nadawcy. `sender_username` jest migawką nazwy używaną przy renderowaniu historii.
+### `mls_conversations`
 
-### `message_reads`
+Mapuje wewnętrzny UUID pokoju na binarny GroupId protokołu MLS.
 
-Jedno potwierdzenie na wiadomość i użytkownika.
+### `mls_envelopes`
 
-### `device_link_requests`
+Zawiera zaszyfrowane lub publiczne komunikaty protokołu: `Application`, `Commit`, `Welcome`, `Proposal` i `KeyPackage`. Payload jest nieprzezroczysty dla backendu. Indeksy wymuszają kolejność i deduplikację.
 
-Tymczasowy kod parowania i urządzenie `pending`. Wdrożenie produkcyjne powinno cyklicznie usuwać wygasłe rekordy.
+### `mls_envelope_recipients`
 
-### `recovery_backups`
+Adresuje Welcome do konkretnych urządzeń i przechowuje potwierdzenie odbioru. Welcome pozostaje dostępny do ACK.
 
-Nieprzezroczysty vault E2EE. `recovery_auth_hash` służy do autoryzowania utworzenia nowego urządzenia po lokalnym odszyfrowaniu vaultu.
+### `mls_message_reads`
 
-## Backup operacyjny
+Potwierdzenia odczytu są metadanymi aplikacyjnymi. Nie zawierają treści wiadomości, ale ujawniają serwerowi aktywność użytkowników.
 
-Backup MySQL chroni ciphertexty i metadane, ale sam nie wystarcza do odzyskania plaintextu. Użytkownik nadal potrzebuje swoich kluczy urządzeń albo kodu odzyskiwania.
+### `mls_device_link_secrets`
 
-```bash
-docker compose exec -T mysql sh -c \
-  'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction "$MYSQL_DATABASE"' \
-  > message-app.sql
-```
+Tymczasowo przechowuje zaszyfrowany eksport tożsamości konta przekazywany zatwierdzonemu urządzeniu.
 
-Odtworzenie do pustego wolumenu:
+## Migracje
 
-```bash
-docker compose up -d mysql
-docker compose exec -T mysql sh -c \
-  'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE"' \
-  < message-app.sql
-```
-
-Regularnie testuj restore. Przechowuj dump zaszyfrowany i ogranicz dostęp, ponieważ zawiera wrażliwe metadane.
-
-## Migracja z poprzedniego SQLite
-
-Nowy backend nie odczytuje `server/data/chat.db`. Migracja danych nie jest automatyczna ze względu na zmianę modelu urządzeń i kluczy. Przed przełączeniem istniejącego wdrożenia należy przygotować migrację dostosowaną do wersji jego schematu, zachować identyfikatory UUID i zweryfikować liczbę rekordów oraz możliwość odszyfrowania historii na aktywnym urządzeniu.
+Backend wykonuje idempotentne `CREATE TABLE IF NOT EXISTS`. Plik `database/schema.sql` jest referencyjnym DDL dla świeżej instalacji. Stare tabele AES mogą pozostać w istniejącej bazie po aktualizacji, lecz kod ich nie odczytuje. Automatyczna migracja ciphertextów i kluczy AES do MLS nie istnieje.

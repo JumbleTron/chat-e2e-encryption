@@ -1,87 +1,57 @@
-# Architektura
+# Architektura MLS
 
-## Komponenty
+## Granice systemu
 
-```text
-Przeglądarka
-  React + Web Crypto + IndexedDB
-        | HTTPS / WSS
-        v
-Nginx
-  statyczny frontend + reverse proxy
-        | HTTP / WebSocket, sieć Docker
-        v
-Node.js + Express + Socket.IO
-        | mysql2, pula połączeń
-        v
-MySQL 8 / InnoDB
-```
+Frontend React jest klientem MLS i jedynym miejscem, w którym powstaje plaintext. `ping-openmls-sdk` uruchamia rdzeń OpenMLS w Web Workerze. Backend Express pełni role Authentication Service oraz Delivery Service, natomiast MySQL przechowuje wyłącznie dane publiczne, metadane i zaszyfrowane koperty.
 
-Frontend wykonuje wszystkie operacje na plaintextach i surowych kluczach pokojów. Backend odpowiada za uwierzytelnianie urządzeń, autoryzację członkostwa, przechowywanie ciphertextów, routing zdarzeń i transakcje. MySQL nie otrzymuje plaintextu wiadomości ani prywatnych kluczy urządzeń.
+## Tożsamości
 
-## Granice zaufania
+- Konto ma stabilny `mls_user_id` wynikający z eksportu tożsamości SDK.
+- Każda sesja urządzenia ma osobny `mls_device_id` i credential.
+- Backend wiąże `sender_device` koperty z uwierzytelnioną sesją HTTP.
+- Urządzenie publikuje pulę jednorazowych KeyPackage oraz jeden pakiet last-resort.
 
-### Klient
+Prywatne klucze, stan grup oraz lokalny cache wiadomości są szyfrowane AES-GCM przez nieeksportowalny klucz Web Crypto zapisany w IndexedDB.
 
-Klient jest punktem końcowym E2EE. Prywatny klucz RSA jest generowany jako nieeksportowalny `CryptoKey` i przechowywany w IndexedDB. Surowe klucze epok pokojów są potrzebne do szyfrowania, odszyfrowywania, zapraszania i tworzenia backupu.
+## Utworzenie grupy
 
-Kod uruchomiony w tym samym origin może używać kluczy Web Crypto. Dlatego CSP, brak skryptów zewnętrznych, ochrona przed XSS i bezpieczny proces dostaw są częścią modelu bezpieczeństwa.
+1. Inicjator tworzy `MlsGroup` w Workerze.
+2. Backend zapisuje mapowanie pokoju na 16-bajtowy GroupId.
+3. Klient pobiera po jednym KeyPackage aktywnych urządzeń.
+4. `addMembers` generuje Commit oraz Welcome.
+5. Delivery Service porządkuje koperty i adresuje Welcome.
 
-### Backend
+## Wiadomości
 
-Backend ufa tokenowi urządzenia dopiero po porównaniu jego hasha z `user_devices.auth_token_hash`. Dane tożsamości przesyłane przez zdarzenia Socket.IO nie są uznawane za wiarygodne; `senderId`, `senderDeviceId` i nazwa nadawcy pochodzą z uwierzytelnionej sesji serwera.
+Payload aplikacyjny zawiera identyfikator wiadomości, autora, czas i tekst. Całość jest przekazywana do `Conversation.send`, więc wszystkie pola payloadu są objęte szyfrowaniem i uwierzytelnieniem MLS. Serwer zapisuje zewnętrzną kopertę, epokę, identyfikator urządzenia i HLC potrzebne do routingu.
 
-### Baza
+Po odszyfrowaniu payload jest zapisywany w lokalnym szyfrowanym cache’u. Cache zapewnia UX historii bez archiwizowania dawnych sekretów grupy na serwerze.
 
-Wyciek MySQL ujawnia metadane: użytkowników, urządzenia, członkostwa, czas wiadomości, potwierdzenia odczytu oraz ciphertexty. Nie powinien ujawnić treści bez kompromitacji urządzenia lub kodu odzyskiwania.
+## Zaproszenie i usunięcie
 
-## Kryptografia
+Zaproszenie jest zmianą członkostwa `Add + Commit + Welcome`. Nowy członek rozpoczyna od nowej epoki i nie dostaje poprzedniej historii.
 
-| Zastosowanie | Algorytm | Parametry |
-|---|---|---|
-| klucz urządzenia | RSA-OAEP | 2048 bit, SHA-256 |
-| klucz pokoju | AES-GCM | 256 bit |
-| IV wiadomości | losowy | 96 bit |
-| token urządzenia | losowy | 256 bit, hash SHA-256 na serwerze |
-| vault odzyskiwania | AES-GCM | klucz odzyskiwania 256 bit |
+Wycofanie urządzenia wywołuje `revokeDevice`, które tworzy Commit dla grup znanych bieżącemu klientowi. Następnie backend unieważnia token sesji. Jeżeli Commit nie może zostać utworzony, klient nie powinien traktować samego unieważnienia tokenu jako kryptograficznego usunięcia.
 
-Projekt nie implementuje Double Ratchet ani MLS. Jedna epoka AES obejmuje wiele wiadomości. Rotacja następuje przy wycofaniu urządzenia, zapewniając odcięcie od przyszłych epok, ale nie pełną forward secrecy per wiadomość.
+## Wiele urządzeń
 
-## Cykl życia urządzenia
+Podczas linkowania nowe urządzenie generuje tymczasową parę RSA-OAEP. Zatwierdzające urządzenie szyfruje do niej eksport tożsamości konta. RSA nie służy do szyfrowania wiadomości ani sekretów pokojów. Po inicjalizacji MLS nowe urządzenie publikuje KeyPackage i jest dodawane do grup jako osobny liść.
 
-### Rejestracja
+## Forward secrecy
 
-1. Przeglądarka generuje parę RSA i losowy token.
-2. Backend tworzy `users` oraz `user_devices`.
-3. Serwer zapisuje klucz publiczny i hash tokenu.
-4. Prywatny `CryptoKey` pozostaje w IndexedDB.
+Forward secrecy zależy od poprawnego postępu ratchetów i trwałego usuwania poprzednich sekretów przez StorageProvider. Projekt nie eksportuje sekretów grup do backupu i nie przekazuje historii nowym członkom. Post-compromise security jest uzyskiwane przez zmiany członkostwa i aktualizacje epok MLS.
 
-### Parowanie
+## Konflikty Commit
 
-1. Nowe urządzenie generuje własne RSA i token.
-2. Serwer tworzy urządzenie `pending` i kod ważny 10 minut.
-3. Aktywne urządzenie porównuje kod.
-4. Odszyfrowuje posiadane klucze epok i szyfruje je RSA nowego urządzenia.
-5. Backend aktywuje urządzenie po zapisaniu kopii kluczy.
+Delivery Service dopuszcza jeden Commit dla danej grupy i epoki. Drugi zapis zwraca `409 EpochOccupied`; klient powinien zsynchronizować grupę przed ponowieniem operacji. Wszystkie koperty mają dodatkową unikalność `(conversation, sender_device, sequence, kind)`.
 
-### Wycofanie
+## Model zagrożeń
 
-1. Aktywne urządzenie oznacza inne urządzenie jako `revoked`.
-2. Wszystkie dotknięte pokoje otrzymują `rotation_required`.
-3. Wysyłanie jest blokowane do zakończenia rotacji.
-4. Klient tworzy nowy AES i kopie dla pozostałych aktywnych urządzeń.
-5. Transakcja zwiększa `current_epoch` i odblokowuje pokój.
+Chronione są treść i integralność wiadomości wobec serwera Delivery Service oraz późniejszego przejęcia aktualnych sekretów. Poza zakresem pozostają:
 
-## Pokój i historia
-
-Wiadomość wskazuje `key_epoch`. Klient przechowuje lokalny zestaw kluczy epok i wybiera odpowiedni podczas odszyfrowania historii. Zaproszenie do istniejącego pokoju jest transakcją obejmującą członkostwo oraz kopię każdego historycznego klucza dla każdego urządzenia zaproszonej osoby.
-
-## Odzyskiwanie
-
-Vault zawiera surowe klucze epok i losowy sekret autoryzujący restore. Jest lokalnie szyfrowany losowym kodem odzyskiwania. MySQL przechowuje ciphertext, IV oraz hash niezależnego sekretu. Kod odzyskiwania nie trafia na backend.
-
-Backup jest migawką. Po zmianie kluczy trzeba utworzyć nową kopię; zastępuje ona poprzednią.
-
-## Obecność
-
-Obecność i mapowanie socketów są w pamięci procesu Node.js. Uruchomienie wielu replik backendu wymaga adaptera Socket.IO opartego np. na Redisie oraz współdzielonego mechanizmu obecności.
+- złośliwy kod działający w originie aplikacji,
+- przejęty endpoint w czasie aktywnej sesji,
+- analiza metadanych,
+- złośliwy Authentication Service,
+- brak key transparency,
+- bezpieczeństwo zależności bez niezależnego audytu.

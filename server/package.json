@@ -13,6 +13,7 @@
     "test:integration": "node tests/integration.js"
   },
   "dependencies": {
+    "cbor-x": "^1.6.4",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "mysql2": "^3.23.1",

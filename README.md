@@ -1,223 +1,145 @@
 # Secure Group Chat
 
-[![CI](https://github.com/JumbleTron/chat-e2e-encryption/actions/workflows/ci.yml/badge.svg)](https://github.com/JumbleTron/chat-e2e-encryption/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+Eksperymentalny komunikator grupowy z szyfrowaniem end-to-end opartym na Messaging Layer Security (MLS, RFC 9420), obsługą wielu urządzeń i serwerem MySQL działającym jako Delivery Service.
 
-Eksperymentalny czat grupowy z szyfrowaniem end-to-end, obsługą wielu urządzeń, historią zaszyfrowaną per epoka, odzyskiwaniem kluczy oraz backendem MySQL.
+> Projekt nie przeszedł niezależnego audytu kryptograficznego. Nie należy traktować go jako gotowego systemu do komunikacji wysokiego ryzyka.
 
-> **Status bezpieczeństwa:** projekt nie przeszedł niezależnego audytu kryptograficznego. Jest przeznaczony do nauki, prototypowania i dalszego hardeningu. Nie używaj go do komunikacji wysokiego ryzyka w obecnej postaci.
+## Właściwości
 
-## Najważniejsze funkcje
+- grupy MLS z forward secrecy i post-compromise security,
+- osobny credential i KeyPackage dla każdego urządzenia,
+- zaproszenia przez `Add + Commit + Welcome`,
+- brak dostępu nowego członka do wiadomości sprzed zaproszenia,
+- wiadomości aplikacyjne jako MLS `PrivateMessage`,
+- Worker WebAssembly oparty na OpenMLS,
+- zaszyfrowany lokalny stan MLS oraz cache wiadomości w IndexedDB,
+- uwierzytelnione sesje urządzeń i kontrola identyfikatora nadawcy po stronie serwera,
+- MySQL 8.4, Socket.IO, React, Nginx i Docker Compose,
+- test przeglądarkowy dwóch niezależnych klientów MLS.
 
-- szyfrowanie wiadomości AES-256-GCM wykonywane w przeglądarce,
-- osobna para RSA-OAEP i token dla każdego urządzenia,
-- parowanie nowego urządzenia kodem weryfikacyjnym,
-- dostęp zatwierdzonego urządzenia do zaszyfrowanej historii,
-- wycofywanie urządzeń i obowiązkowa rotacja klucza pokoju,
-- zapraszanie do istniejącego pokoju wraz z kluczami wszystkich epok,
-- opcjonalny vault odzyskiwania chroniony losowym kluczem 256-bitowym,
-- uwierzytelnione REST API i Socket.IO,
-- obecność, pisanie oraz potwierdzenia odczytu,
-- MySQL 8 / InnoDB z transakcjami i kluczami obcymi,
-- Docker Compose, Nginx, healthchecki i CI.
-
-## Architektura
-
-```text
-┌────────────────────────────────────────────┐
-│ Przeglądarka                               │
-│ React + Web Crypto + IndexedDB             │
-│ plaintext i prywatny klucz pozostają tutaj │
-└──────────────────────┬─────────────────────┘
-                       │ HTTPS / WSS
-┌──────────────────────▼─────────────────────┐
-│ Nginx                                      │
-│ frontend SPA + reverse proxy               │
-└──────────────────────┬─────────────────────┘
-                       │ HTTP / WebSocket
-┌──────────────────────▼─────────────────────┐
-│ Node.js + Express + Socket.IO              │
-│ auth urządzeń, autoryzacja, routing         │
-└──────────────────────┬─────────────────────┘
-                       │ mysql2 / pool
-┌──────────────────────▼─────────────────────┐
-│ MySQL 8 / InnoDB                           │
-│ ciphertexty, klucze opakowane, metadane    │
-└────────────────────────────────────────────┘
-```
-
-Szczegółowe granice zaufania i przepływy opisuje [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Model MySQL znajduje się w [docs/DATABASE.md](docs/DATABASE.md), a referencyjny DDL w [database/schema.sql](database/schema.sql).
-
-Zalecenia operacyjne i checklista produkcyjna są w [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
-
-## Model kryptograficzny
-
-### Urządzenie
-
-Każde urządzenie generuje własną parę RSA-OAEP 2048/SHA-256. Klucz prywatny jest nieeksportowalnym `CryptoKey` w IndexedDB. Serwer przechowuje klucz publiczny i SHA-256 losowego tokenu sesji.
-
-### Pokój
-
-Pokój używa AES-256-GCM. Klucz danej epoki jest szyfrowany RSA osobno dla każdego aktywnego urządzenia i zapisywany w `room_device_keys`:
-
-```text
-(room_id, device_id, key_epoch) -> encrypted_group_key
-```
-
-Wiadomość zawiera ciphertext, losowy 96-bitowy IV oraz numer epoki. Backend nie otrzymuje plaintextu ani surowego klucza AES.
-
-### Rotacja
-
-Wycofanie urządzenia oznacza związane pokoje jako `rotation_required`. Backend odrzuca nowe wiadomości, dopóki klient nie utworzy kolejnej epoki dla pozostałych urządzeń. Wycofane urządzenie zachowuje wiedzę o wcześniej udostępnionych treściach, ale nie otrzymuje przyszłych kluczy.
-
-### Odzyskiwanie
-
-Vault zawiera historyczne klucze pokojów i niezależny sekret restore. Jest szyfrowany lokalnie AES-GCM losowym kodem odzyskiwania. Kod nie trafia na serwer. Backup jest migawką i powinien zostać odnowiony po utworzeniu pokoju lub rotacji.
-
-## Szybki start: Docker
-
-Wymagane są Docker Engine i Docker Compose.
+## Szybki start
 
 ```bash
 cp .env.example .env
-```
-
-Zmień oba hasła MySQL w `.env`, następnie:
-
-```bash
+# ustaw silne hasła w .env
 docker compose up -d --build
-docker compose ps
 ```
 
-Aplikacja będzie dostępna pod `http://localhost:8080`. Jeśli port jest zajęty, ustaw np. `APP_PORT=8081` i dopasuj `PUBLIC_ORIGIN`:
-
-```env
-APP_PORT=8081
-PUBLIC_ORIGIN=http://localhost:8081
-```
-
-Logi i zatrzymanie:
+Aplikacja jest domyślnie dostępna pod `http://localhost:8080`, a healthcheck pod `http://localhost:8080/api/health`.
 
 ```bash
+docker compose ps
 docker compose logs -f
 docker compose down
 ```
 
-`docker compose down` nie usuwa danych. Usunięcie wolumenu MySQL wymaga jawnego `docker compose down -v` i bezpowrotnie kasuje dane serwera.
+## Architektura
 
-## Rozwój lokalny
+```text
+React
+  |
+  | MessagingClient -> Web Worker -> OpenMLS/WASM
+  | zaszyfrowany IndexedDB
+  |
+Nginx :8080
+  |-- /api        -> Node.js/Express
+  `-- /socket.io  -> Socket.IO
+                         |
+                       MySQL
+```
 
-Wymagany Node.js 22+.
+Klient jest końcem E2EE. Serwer przechowuje publiczne KeyPackage, członkostwo aplikacyjne, zaszyfrowane koperty MLS i adresowanie Welcome. Nie otrzymuje plaintextu ani sekretów grup.
+
+Szczegóły znajdują się w [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), a opis tabel w [docs/DATABASE.md](docs/DATABASE.md).
+
+## Przepływ MLS
+
+1. Urządzenie inicjalizuje credential MLS i publikuje pulę jednorazowych KeyPackage.
+2. Twórca pokoju tworzy lokalną grupę MLS.
+3. Urządzenia uczestników są dodawane przez Commit.
+4. Każde zaproszone urządzenie otrzymuje adresowany Welcome.
+5. Wiadomość jest szyfrowana przez ratchet MLS i zapisywana jako nieprzezroczysta koperta.
+6. Po zmianie członkostwa powstaje nowa epoka; stare sekrety są usuwane przez magazyn SDK.
+
+Dołączający użytkownik widzi wiadomości od momentu dołączenia. Historia odszyfrowana wcześniej przez dane urządzenie jest przechowywana wyłącznie w jego szyfrowanym cache’u IndexedDB.
+
+## Wiele urządzeń
+
+RSA-OAEP jest używany tylko jako kanał bootstrapu podczas zatwierdzania nowego urządzenia. Istniejące urządzenie przesyła nim eksport tożsamości konta. Nowe urządzenie:
+
+1. publikuje własny KeyPackage,
+2. jest dodawane jako osobny liść do każdej grupy,
+3. otrzymuje osobny Welcome,
+4. nie dostaje historycznych sekretów grup.
+
+Wycofanie urządzenia generuje Commit usuwający jego liść. Dopiero poprawnie dostarczony Commit odcina urządzenie kryptograficznie; samo unieważnienie sesji HTTP nie zastępuje operacji MLS.
+
+## Odzyskiwanie
+
+Kopia odzyskiwania zawiera zaszyfrowaną tożsamość konta, ale nie historyczne stany grup. To celowy wybór na rzecz forward secrecy. Odzyskane urządzenie potrzebuje ponownego dodania do pokojów i nie odzyska wcześniejszej lokalnej historii.
+
+## Development
+
+Wymagania: Node.js 22+, Docker i Docker Compose.
 
 ```bash
-cp .env.example .env
 npm run install:all
-npm run docker:infra
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d mysql
 npm run dev
 ```
 
-Override [docker-compose.dev.yml](docker-compose.dev.yml) publikuje MySQL na `3306`. Frontend Vite działa domyślnie na `5173`, a API i Socket.IO na `3001`.
-
-Zmiana portów:
-
-```env
-MYSQL_PORT=3307
-API_PORT=3002
-```
-
-Przy niestandardowym porcie MySQL ustaw również `DB_PORT` dla procesu Node. Konfigurację proxy Vite można zmienić przez `VITE_BACKEND_URL`.
-
-## Konfiguracja
-
-| Zmienna | Domyślna | Znaczenie |
-|---|---:|---|
-| `APP_PORT` | `8080` | publiczny port Nginx |
-| `PUBLIC_ORIGIN` | `http://localhost:8080` | dozwolony origin CORS/Socket.IO |
-| `MYSQL_DATABASE` | `message_app` | nazwa bazy |
-| `MYSQL_USER` | `message_app` | użytkownik aplikacyjny |
-| `MYSQL_PASSWORD` | brak bezpiecznej wartości | hasło aplikacyjne |
-| `MYSQL_ROOT_PASSWORD` | brak bezpiecznej wartości | hasło administratora kontenera |
-| `DB_HOST` | `127.0.0.1` | host MySQL dla backendu |
-| `DB_PORT` | `3306` | port MySQL dla backendu |
-| `DB_CONNECTION_LIMIT` | `10` | rozmiar puli `mysql2` |
-| `JSON_BODY_LIMIT` | `2mb` | limit requestów, w tym vaultu |
-
-Wartości `change-me-*` w Compose służą wyłącznie jako zabezpieczenie przed brakiem konfiguracji. Publiczne wdrożenie musi używać unikalnych sekretów i nie powinno publikować portu MySQL.
-
-## Baza danych
-
-Backend przy starcie czeka na MySQL i idempotentnie tworzy dziewięć tabel:
-
-| Tabela | Dane |
-|---|---|
-| `users` | logiczne konta |
-| `user_devices` | klucze publiczne, hash tokenu i status urządzeń |
-| `rooms` | twórca, aktywna epoka i stan rotacji |
-| `room_members` | członkostwo użytkowników |
-| `room_device_keys` | opakowany AES per urządzenie i epoka |
-| `messages` | ciphertext, IV, epoka i urządzenie nadawcy |
-| `message_reads` | potwierdzenia odczytu |
-| `device_link_requests` | krótkotrwałe parowanie |
-| `recovery_backups` | zaszyfrowany vault |
-
-Poprzednia baza SQLite nie jest automatycznie importowana. Zobacz sekcję migracji w [docs/DATABASE.md](docs/DATABASE.md).
+Frontend działa domyślnie na `http://localhost:5173`, backend na `http://localhost:3001`, a deweloperski MySQL na `localhost:3306`.
 
 ## Testy
 
-Kontrola składni i build klienta:
-
 ```bash
 npm run check
+npm run test:integration
+TEST_ORIGIN=http://127.0.0.1:8080 npm run test:mls
 ```
 
-Test integracyjny wymaga działającego backendu z pustą lub testową bazą:
+`test:integration` sprawdza kontrakt Delivery Service, MySQL, routing Welcome i powiązanie nadawcy z uwierzytelnionym urządzeniem. `test:mls` uruchamia dwa izolowane konteksty Chrome i wykonuje prawdziwy przepływ OpenMLS: utworzenie grupy, Commit, Welcome oraz PrivateMessage.
 
-```bash
-TEST_ORIGIN=http://127.0.0.1:8080 npm run test:integration
-```
+## Najważniejsze tabele
 
-Test generuje prawdziwe klucze Web Crypto, tworzy konto i pokój, wykonuje handshake WebSocket, przekazuje RSA klucz AES, zapisuje ciphertext do MySQL i odszyfrowuje odebraną wiadomość.
+| Tabela | Rola |
+| --- | --- |
+| `users`, `user_devices` | konto, sesje i status urządzeń |
+| `room_members`, `room_pending_members` | aktywne członkostwo i zaproszenia oczekujące na Welcome |
+| `mls_user_profiles` | powiązanie konta z credentialem MLS |
+| `mls_device_profiles` | powiązanie sesji z urządzeniem MLS |
+| `mls_key_packages` | jednorazowe i last-resort KeyPackage |
+| `mls_conversations` | mapowanie pokoju na GroupId MLS |
+| `mls_envelopes` | Commit, Welcome, Proposal i PrivateMessage |
+| `mls_envelope_recipients` | adresowanie oraz ACK dla Welcome |
+| `mls_message_reads` | metadane potwierdzeń odczytu |
 
-GitHub Actions uruchamia build oraz test integracyjny z usługą MySQL 8.4 dla każdego pull requestu do `main`.
+Pełny DDL: [database/schema.sql](database/schema.sql).
 
-## Endpointy
+## Konfiguracja
 
-Najważniejsze grupy API:
+| Zmienna | Domyślna wartość | Znaczenie |
+| --- | --- | --- |
+| `APP_PORT` | `8080` | publiczny port Nginx |
+| `PUBLIC_ORIGIN` | `http://localhost:8080` | dozwolony origin klienta |
+| `PORT` | `3001` | port backendu w kontenerze |
+| `MYSQL_DATABASE` | `message_app` | baza MySQL |
+| `MYSQL_USER` | `message_app` | użytkownik aplikacyjny |
+| `MYSQL_PASSWORD` | wymagane produkcyjnie | hasło użytkownika |
+| `MYSQL_ROOT_PASSWORD` | wymagane produkcyjnie | hasło administratora |
+| `DB_CONNECTION_LIMIT` | `10` | limit połączeń backendu |
+| `JSON_BODY_LIMIT` | `2mb` | maksymalna koperta API |
 
-- `POST /api/users` - rejestracja konta i pierwszego urządzenia,
-- `/api/device-links` - rozpoczęcie, sprawdzenie i zatwierdzenie parowania,
-- `/api/devices` - lista oraz wycofywanie urządzeń,
-- `/api/rooms` - lista i tworzenie pokojów,
-- `/api/rooms/:id/members` - atomowe zaproszenie z kluczami historii,
-- `/api/rooms/:id/rotate-key` - nowa epoka,
-- `/api/recovery-backup` i `/api/recovery-restore` - vault,
-- `/api/health` - zdrowie backendu i MySQL.
+## Model zaufania i ograniczenia
 
-Wiadomości, obecność, pisanie, historia i dystrybucja kluczy online korzystają z Socket.IO.
-
-## Ograniczenia
-
-- brak Double Ratchet i MLS, więc nie ma pełnej forward secrecy per wiadomość,
-- brak safety numbers dla kontaktów i trwałego logu przejrzystości kluczy,
-- token sesji jest przechowywany w `localStorage`,
-- XSS w origin aplikacji może użyć klucza z IndexedDB i odczytać plaintext,
-- obecność Socket.IO jest lokalna dla jednego procesu; skalowanie wymaga adaptera Redis,
-- wygasłe żądania parowania wymagają okresowego czyszczenia,
-- brak automatycznej migracji danych z wcześniejszej wersji SQLite,
-- brak niezależnego audytu bezpieczeństwa.
-
-## Roadmap
-
-- protokół grupowy MLS albo dojrzała implementacja Signal Protocol,
-- podpisy urządzeń, safety numbers i historia zmian kluczy,
-- Redis adapter dla wielu replik backendu,
-- rate limiting, monitoring i metryki,
-- migracje wersjonowane zamiast samego `CREATE TABLE IF NOT EXISTS`,
-- automatyczne odświeżanie vaultu po zmianach kluczy,
-- pełne testy przeglądarkowe i testy negatywne autoryzacji.
+- Serwer widzi konta, urządzenia, członkostwo, czas, wielkość i kierunek ruchu.
+- Authentication Service jest zaufany w zakresie mapowania credentialu MLS do konta.
+- XSS działający w originie aplikacji może korzystać z aktywnego klienta i odszyfrować bieżące dane.
+- Szyfrowanie IndexedDB chroni dane spoczynkowe, ale nie zastępuje bezpiecznego systemu operacyjnego.
+- Wrapper `ping-openmls-sdk` jest zależnością eksperymentalną opartą na OpenMLS i wymaga osobnego audytu przed produkcją.
+- Migracja starych pokojów AES nie jest automatyczna; należy utworzyć nowe pokoje MLS.
+- Serwer nie zapewnia ukrywania metadanych ani key transparency.
 
 ## Open source
 
-Zasady współpracy opisuje [CONTRIBUTING.md](CONTRIBUTING.md), prywatne zgłaszanie podatności [SECURITY.md](SECURITY.md), a zasady społeczności [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
-
-Projekt jest udostępniany na licencji [MIT](LICENSE).
+Projekt jest udostępniony na licencji [MIT](LICENSE). Licencje kluczowych zależności opisuje [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Zgłoszenia i pull requesty opisują [CONTRIBUTING.md](CONTRIBUTING.md), a prywatne zgłoszenia bezpieczeństwa [SECURITY.md](SECURITY.md).

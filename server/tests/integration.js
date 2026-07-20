@@ -1,123 +1,107 @@
 import assert from 'node:assert/strict';
-import { io } from 'socket.io-client';
+import { randomBytes, randomUUID } from 'node:crypto';
 
 const origin = process.env.TEST_ORIGIN || 'http://127.0.0.1:3001';
-const apiBase = `${origin}/api`;
 
-const toBase64 = (value) => Buffer.from(value).toString('base64');
-const fromBase64 = (value) => Buffer.from(value, 'base64');
+function b64(bytes = randomBytes(32)) {
+  return Buffer.from(bytes).toString('base64');
+}
 
-async function api(path, { token, method = 'GET', body } = {}) {
-  const response = await fetch(`${apiBase}${path}`, {
-    method,
-    headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(`${method} ${path}: ${response.status} ${JSON.stringify(data)}`);
+async function api(path, options = {}, token = null) {
+  const headers = new Headers(options.headers || {});
+  if (options.body) headers.set('content-type', 'application/json');
+  if (token) headers.set('authorization', `Bearer ${token}`);
+  const response = await fetch(`${origin}/api${path}`, { ...options, headers });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`${response.status}: ${data.error || 'request failed'}`);
   return data;
 }
 
-function waitFor(socket, event, timeoutMs = 10_000) {
-  return new Promise((resolve, reject) => {
-    const cleanup = () => {
-      clearTimeout(timeout);
-      socket.off(event, onResult);
-      socket.off('connect_error', onError);
-      socket.off('server:error', onError);
-    };
-    const onResult = (value) => {
-      cleanup();
-      resolve(value);
-    };
-    const onError = (error) => {
-      cleanup();
-      reject(error instanceof Error ? error : new Error(JSON.stringify(error)));
-    };
-    const timeout = setTimeout(() => {
-      cleanup();
-      reject(new Error(`Timed out waiting for ${event}`));
-    }, timeoutMs);
-    socket.once(event, onResult);
-    socket.once('connect_error', onError);
-    socket.once('server:error', onError);
-  });
-}
-
-const suffix = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 6)}`;
-const authToken = `integration-${suffix}`;
-let socket;
-
-try {
-  const keyPair = await crypto.subtle.generateKey(
-    { name: 'RSA-OAEP', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
-    true,
-    ['encrypt', 'decrypt']
-  );
-  const publicKey = toBase64(await crypto.subtle.exportKey('spki', keyPair.publicKey));
+async function register(username) {
+  const authToken = b64();
   const user = await api('/users', {
     method: 'POST',
-    body: { username: `ci-${suffix}`, publicKey, authToken, deviceName: 'CI device' },
+    body: JSON.stringify({ username, publicKey: b64(), authToken, deviceName: 'Integration test' }),
   });
-
-  const groupKey = await crypto.subtle.generateKey(
-    { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']
-  );
-  const rawGroupKey = await crypto.subtle.exportKey('raw', groupKey);
-  const wrappedKey = toBase64(await crypto.subtle.encrypt(
-    { name: 'RSA-OAEP' }, keyPair.publicKey, rawGroupKey
-  ));
-  const room = await api('/rooms', {
-    token: authToken,
+  const mlsUserId = randomBytes(32);
+  const mlsDeviceId = randomBytes(32);
+  await api('/mls/devices/register', {
     method: 'POST',
-    body: {
-      name: 'Integration room', memberIds: [user.id],
-      encryptedDeviceKeys: { [user.deviceId]: wrappedKey },
-    },
-  });
-
-  socket = io(origin, {
-    transports: ['websocket'],
-    auth: { deviceId: user.deviceId, token: authToken },
-  });
-  await waitFor(socket, 'connect');
-  const historyPromise = waitFor(socket, 'room:history');
-  socket.emit('room:join', { roomId: room.id });
-  const history = await historyPromise;
-  assert.equal(history.currentEpoch, 1);
-  assert.equal(history.encryptedGroupKeys.length, 1);
-
-  const recoveredKey = await crypto.subtle.decrypt(
-    { name: 'RSA-OAEP' }, keyPair.privateKey,
-    fromBase64(history.encryptedGroupKeys[0].encryptedGroupKey)
-  );
-  assert.deepEqual(Buffer.from(recoveredKey), Buffer.from(rawGroupKey));
-
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv }, groupKey, new TextEncoder().encode('MySQL E2EE integration')
-  );
-  const messagePromise = waitFor(socket, 'message:new');
-  socket.emit('message:send', {
-    roomId: room.id,
-    message: {
-      id: crypto.randomUUID(), ciphertext: toBase64(ciphertext),
-      iv: toBase64(iv), keyEpoch: 1, timestamp: Date.now(),
-    },
-  });
-  const message = await messagePromise;
-  assert.equal(message.senderId, user.id);
-  assert.equal(message.senderDeviceId, user.deviceId);
-  const plaintext = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: fromBase64(message.iv) }, groupKey, fromBase64(message.ciphertext)
-  );
-  assert.equal(new TextDecoder().decode(plaintext), 'MySQL E2EE integration');
-  assert.ok((await api('/rooms', { token: authToken })).some((item) => item.id === room.id));
-
-  console.log('Integration test passed: MySQL, authenticated WebSocket and E2EE message flow.');
-} finally {
-  socket?.close();
+    body: JSON.stringify({
+      mlsUserId: b64(mlsUserId),
+      mlsDeviceId: b64(mlsDeviceId),
+      keyPackages: [b64(randomBytes(128))],
+      lastResortKeyPackage: b64(randomBytes(128)),
+    }),
+  }, authToken);
+  return { ...user, authToken, mlsUserId, mlsDeviceId };
 }
+
+const suffix = Date.now().toString(36);
+const alice = await register(`api_alice_${suffix}`);
+const bob = await register(`api_bob_${suffix}`);
+const conversationId = randomBytes(16);
+const room = await api('/rooms', {
+  method: 'POST',
+  body: JSON.stringify({
+    name: `API MLS ${suffix}`,
+    memberIds: [bob.id],
+    conversationId: b64(conversationId),
+  }),
+}, alice.authToken);
+
+const claimed = await api(`/mls/users/${alice.mlsUserId.toString('hex')}/devices`, {
+  method: 'POST',
+}, bob.authToken);
+assert.equal(claimed.length, 1);
+
+function envelope(kind, overrides = {}) {
+  return {
+    version: 2,
+    conversationId: b64(conversationId),
+    epoch: 1,
+    kind,
+    senderDeviceId: b64(alice.mlsDeviceId),
+    sequence: overrides.sequence || 1,
+    wallTime: Date.now(),
+    logicalTime: 0,
+    payload: b64(randomBytes(96)),
+    contentHash: b64(randomBytes(32)),
+    ...overrides,
+  };
+}
+
+const welcome = await api('/mls/envelopes', {
+  method: 'POST',
+  body: JSON.stringify({
+    envelope: envelope('Welcome'), recipients: [b64(bob.mlsDeviceId)],
+  }),
+}, alice.authToken);
+const pending = await api('/mls/welcomes', {}, bob.authToken);
+assert.equal(pending.some((item) => item.id === welcome.id), true);
+await api(`/mls/welcomes/${welcome.id}/ack`, { method: 'POST' }, bob.authToken);
+
+await api('/mls/envelopes', {
+  method: 'POST', body: JSON.stringify({ envelope: envelope('Application', { sequence: 2 }) }),
+}, alice.authToken);
+const history = await api(
+  `/mls/conversations/${conversationId.toString('hex')}/envelopes?limit=100`, {}, bob.authToken
+);
+assert.equal(history.length >= 2, true);
+assert.equal(history.some((item) => item.kind === 'Application'), true);
+assert.equal((await api('/rooms', {}, bob.authToken)).some((item) => item.id === room.id), true);
+
+let spoofRejected = false;
+try {
+  await api('/mls/envelopes', {
+    method: 'POST',
+    body: JSON.stringify({ envelope: envelope('Application', {
+      sequence: 3, senderDeviceId: b64(bob.mlsDeviceId),
+    }) }),
+  }, alice.authToken);
+} catch (error) {
+  spoofRejected = error.message.startsWith('403:');
+}
+assert.equal(spoofRejected, true);
+
+console.log('Integration test passed: MySQL MLS Delivery Service, Welcome routing and sender binding.');

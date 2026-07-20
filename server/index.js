@@ -3,45 +3,52 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
-import { createHash, createPublicKey, publicEncrypt, randomBytes } from 'crypto';
+import { createHash } from 'crypto';
+import { Decoder } from 'cbor-x';
 import {
   activateDevice,
-  addMessageRead,
-  copyLegacyRoomKeysToDevice,
+  addMlsKeyPackages,
+  addMlsMessageRead,
+  addMlsRoomMembers,
+  acknowledgeMlsWelcome,
   closeDatabase,
   createDevice,
   createLinkRequest,
-  createRoom,
+  createMlsRoom,
   createUser,
-  findDeviceById,
   findDeviceByTokenHash,
   findLinkRequest,
-  findRoomById,
+  findMlsDeviceByServerDevice,
+  finalizeMlsPendingMembers,
+  findMlsRoomByConversation,
+  findMlsRoomById,
+  findServerUsersForMlsDevices,
   findUserById,
   findUserByUsername,
-  getAllDeviceRoomKeys,
   getDbDescription,
-  getMessageReads,
+  getMlsMessageReads,
+  getMlsLinkApprover,
+  getMlsProfile,
+  getMlsPendingMemberIds,
   getRecoveryBackup,
-  getRoomActiveDevices,
-  getRoomDeviceKeys,
-  getRoomKeyEpochs,
   getRoomMemberIds,
   getRoomMembers,
-  getRoomMessages,
   getUserRoomIds,
   initDatabase,
-  insertMessage,
-  inviteRoomMembers,
+  insertMlsEnvelope,
   listPendingLinkRequests,
+  listMlsEnvelopes,
+  listPendingMlsWelcomes,
   listRooms,
   listUserDevices,
   listUsers,
   pingDatabase,
+  claimMlsDevices,
+  claimMlsDevice,
+  registerMlsProfile,
   revokeDevice,
-  rotateRoomKey,
   saveRecoveryBackup,
-  setRoomDeviceKeys,
+  saveMlsLinkSecret,
   touchDevice,
 } from './db.js';
 
@@ -51,16 +58,62 @@ const allowedOrigin = process.env.CLIENT_ORIGIN || '*';
 const io = new Server(httpServer, {
   cors: { origin: allowedOrigin, methods: ['GET', 'POST', 'DELETE'] },
 });
+const cborDecoder = new Decoder({ mapsAsObjects: false });
 
 app.use(cors({ origin: allowedOrigin }));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '2mb' }));
 
 const onlineUsers = new Map(); // socketId -> userId
 const userSockets = new Map(); // deviceId -> socketId
-const legacyChallenges = new Map();
 
 function hashToken(token) {
   return createHash('sha256').update(token).digest('hex');
+}
+
+function parseBase64(value, label, maxLength = 1024 * 1024) {
+  if (typeof value !== 'string' || !value.length) throw new Error(`${label} is required`);
+  const buffer = Buffer.from(value, 'base64');
+  if (!buffer.length || buffer.length > maxLength || buffer.toString('base64').replace(/=+$/, '') !== value.replace(/=+$/, '')) {
+    throw new Error(`${label} is invalid`);
+  }
+  return buffer;
+}
+
+function serializeMlsEnvelope(row) {
+  return {
+    version: Number(row.version),
+    conversationId: Buffer.from(row.conversationId).toString('base64'),
+    epoch: Number(row.epoch),
+    kind: row.kind,
+    senderDeviceId: Buffer.from(row.senderMlsDeviceId).toString('base64'),
+    sequence: Number(row.sequenceNumber),
+    wallTime: Number(row.wallTime),
+    logicalTime: Number(row.logicalTime),
+    payload: Buffer.from(row.payload).toString('base64'),
+    contentHash: Buffer.from(row.contentHash).toString('base64'),
+  };
+}
+
+function parseMlsCursor(value) {
+  if (!value) return { epoch: 0, lastSequencePerDevice: new Map() };
+  const bytes = parseBase64(value, 'cursor', 4096);
+  const decoded = cborDecoder.decode(bytes);
+  if (!(decoded instanceof Map)) throw new Error('cursor is invalid');
+  const epoch = Number(decoded.get('epoch'));
+  const sequences = decoded.get('last_seq_per_device');
+  if (!Number.isSafeInteger(epoch) || epoch < 0 || !(sequences instanceof Map) || sequences.size > 1024) {
+    throw new Error('cursor is invalid');
+  }
+  const lastSequencePerDevice = new Map();
+  for (const [deviceId, sequence] of sequences) {
+    const id = Buffer.from(deviceId);
+    const number = Number(sequence);
+    if (!id.length || id.length > 64 || !Number.isSafeInteger(number) || number < 0) {
+      throw new Error('cursor is invalid');
+    }
+    lastSequencePerDevice.set(id.toString('hex'), { deviceId: id, sequence: number });
+  }
+  return { epoch, lastSequencePerDevice };
 }
 
 async function findAuthenticatedDevice(token) {
@@ -108,43 +161,6 @@ app.post('/api/users', route(async (req, res) => {
   res.json({ ...user, deviceId: device.id });
 }));
 
-app.post('/api/devices/legacy-challenge', route(async (req, res) => {
-  const user = await findUserById(req.body.userId);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  try {
-    const challenge = randomBytes(32);
-    const encrypted = publicEncrypt({
-      key: createPublicKey({ key: Buffer.from(user.publicKey, 'base64'), format: 'der', type: 'spki' }),
-      oaepHash: 'sha256',
-    }, challenge);
-    const challengeId = uuidv4();
-    legacyChallenges.set(challengeId, {
-      userId: user.id, proof: challenge.toString('base64'), expiresAt: Date.now() + 5 * 60_000,
-    });
-    res.json({ challengeId, encryptedChallenge: encrypted.toString('base64') });
-  } catch {
-    res.status(400).json({ error: 'Invalid legacy public key' });
-  }
-}));
-
-app.post('/api/devices/legacy-complete', route(async (req, res) => {
-  const { challengeId, proof, authToken, deviceName = 'Pierwsze urządzenie' } = req.body;
-  const challenge = legacyChallenges.get(challengeId);
-  legacyChallenges.delete(challengeId);
-  if (!challenge || challenge.expiresAt < Date.now() || challenge.proof !== proof || !authToken) {
-    return res.status(401).json({ error: 'Invalid or expired challenge' });
-  }
-  const user = await findUserById(challenge.userId);
-  const existing = (await listUserDevices(user.id)).find((item) => item.publicKey === user.publicKey);
-  if (existing) return res.status(409).json({ error: 'Legacy device already migrated' });
-  const device = await createDevice({
-    id: uuidv4(), userId: user.id, name: deviceName, publicKey: user.publicKey,
-    authTokenHash: hashToken(authToken),
-  });
-  await copyLegacyRoomKeysToDevice(user.id, device.id);
-  res.json({ id: user.id, username: user.username, deviceId: device.id });
-}));
-
 app.post('/api/device-links', route(async (req, res) => {
   const { username, publicKey, authToken, deviceName = 'Nowe urządzenie' } = req.body;
   if (String(deviceName).trim().length > 64) return res.status(400).json({ error: 'Device name is too long' });
@@ -175,7 +191,7 @@ app.get('/api/device-links/:id/status', route(async (req, res) => {
     const user = await findUserById(device.userId);
     return res.json({ status: 'approved', user: {
       id: user.id, username: user.username, deviceId: device.id, publicKey: device.publicKey,
-    } });
+    }, encryptedMlsIdentity: request.encryptedMlsIdentity });
   }
   res.json({ status: 'pending' });
 }));
@@ -186,26 +202,27 @@ app.get('/api/device-links', requireAuth, route(async (req, res) => {
 
 app.post('/api/device-links/:id/approve', requireAuth, route(async (req, res) => {
   const request = await findLinkRequest(req.params.id);
-  const { encryptedRoomKeys = [] } = req.body;
+  const { encryptedMlsIdentity } = req.body;
   if (!request || request.userId !== req.device.userId || request.expiresAt < Date.now()) {
     return res.status(404).json({ error: 'Link request not found or expired' });
   }
-  for (const item of encryptedRoomKeys) {
-    if ((await getRoomMemberIds(item.roomId)).includes(request.userId)) {
-      await setRoomDeviceKeys(item.roomId, item.keyEpoch, { [request.deviceId]: item.encryptedGroupKey });
-    }
+  if (!encryptedMlsIdentity || encryptedMlsIdentity.length > 16_384) {
+    return res.status(400).json({ error: 'Encrypted MLS identity is required' });
   }
+  await saveMlsLinkSecret(request.id, encryptedMlsIdentity, req.device.id);
   await activateDevice(request.deviceId);
   io.to(`device:${request.deviceId}`).emit('device:link-approved');
   res.json({ ok: true });
 }));
 
 app.get('/api/devices', requireAuth, route(async (req, res) => {
-  res.json(await listUserDevices(req.device.userId, true));
-}));
-
-app.get('/api/devices/me/room-keys', requireAuth, route(async (req, res) => {
-  res.json(await getAllDeviceRoomKeys(req.device.id));
+  const devices = await listUserDevices(req.device.userId, true);
+  const profiles = await Promise.all(devices.map((device) => findMlsDeviceByServerDevice(device.id)));
+  res.json(devices.map((device, index) => ({
+    ...device,
+    mlsDeviceId: profiles[index]?.mlsDeviceId
+      ? Buffer.from(profiles[index].mlsDeviceId).toString('base64') : null,
+  })));
 }));
 
 app.post('/api/recovery-backup', requireAuth, route(async (req, res) => {
@@ -227,7 +244,6 @@ app.get('/api/recovery-backup/:username', route(async (req, res) => {
 app.post('/api/recovery-restore', route(async (req, res) => {
   const {
     username, recoveryAuthToken, publicKey, authToken, deviceName = 'Odzyskane urządzenie',
-    encryptedRoomKeys = [],
   } = req.body;
   const user = username?.trim() ? await findUserByUsername(username) : null;
   if (String(deviceName).trim().length > 64) return res.status(400).json({ error: 'Device name is too long' });
@@ -240,11 +256,6 @@ app.post('/api/recovery-restore', route(async (req, res) => {
     id: uuidv4(), userId: user.id, name: deviceName, publicKey,
     authTokenHash: hashToken(authToken),
   });
-  for (const item of encryptedRoomKeys) {
-    if ((await getRoomMemberIds(item.roomId)).includes(user.id)) {
-      await setRoomDeviceKeys(item.roomId, item.keyEpoch, { [device.id]: item.encryptedGroupKey });
-    }
-  }
   res.json({ id: user.id, username: user.username, deviceId: device.id });
 }));
 
@@ -268,49 +279,220 @@ app.get('/api/users/:userId/public-key', requireAuth, route(async (req, res) => 
   res.json({ publicKey: user.publicKey });
 }));
 
-app.get('/api/users', requireAuth, route(async (_req, res) => res.json(await listUsers())));
+app.get('/api/users', requireAuth, route(async (_req, res) => {
+  const users = await listUsers();
+  res.json(users.map((user) => ({
+    ...user,
+    mlsUserId: user.mlsUserId ? Buffer.from(user.mlsUserId).toString('base64') : null,
+    devices: user.devices.map((device) => ({
+      ...device,
+      mlsDeviceId: device.mlsDeviceId ? Buffer.from(device.mlsDeviceId).toString('base64') : null,
+    })),
+  })));
+}));
+
+app.post('/api/mls/devices/register', requireAuth, route(async (req, res) => {
+  const mlsUserId = parseBase64(req.body.mlsUserId, 'mlsUserId', 64);
+  const mlsDeviceId = parseBase64(req.body.mlsDeviceId, 'mlsDeviceId', 64);
+  const keyPackages = (req.body.keyPackages || []).map((value) => parseBase64(value, 'keyPackage', 64 * 1024));
+  const lastResortKeyPackage = req.body.lastResortKeyPackage
+    ? parseBase64(req.body.lastResortKeyPackage, 'lastResortKeyPackage', 64 * 1024)
+    : null;
+  if (keyPackages.length > 32) return res.status(400).json({ error: 'Too many KeyPackages' });
+  try {
+    await registerMlsProfile({
+      userId: req.device.userId, deviceId: req.device.id, mlsUserId, mlsDeviceId,
+    });
+  } catch (error) {
+    if (error.message === 'MLS_USER_ID_MISMATCH' || error.message === 'MLS_DEVICE_ID_MISMATCH') {
+      return res.status(409).json({ error: 'MLS identity does not match the registered account or device' });
+    }
+    throw error;
+  }
+  await addMlsKeyPackages(req.device.id, keyPackages, lastResortKeyPackage);
+  if (keyPackages.length || lastResortKeyPackage) {
+    const link = await getMlsLinkApprover(req.device.id);
+    io.to(link ? `device:${link.approvingDeviceId}` : `user:${req.device.userId}`)
+      .emit('mls:device-ready', { deviceId: req.device.id });
+  }
+  const profile = await getMlsProfile(req.device.id);
+  res.status(201).json({ ok: true, availablePackages: Number(profile.availablePackages) });
+}));
+
+app.post('/api/mls/users/:mlsUserId/devices', requireAuth, route(async (req, res) => {
+  if (!/^[a-f0-9]{2,128}$/i.test(req.params.mlsUserId) || req.params.mlsUserId.length % 2) {
+    return res.status(400).json({ error: 'Invalid MLS user id' });
+  }
+  const devices = await claimMlsDevices(Buffer.from(req.params.mlsUserId, 'hex'));
+  res.json(devices.map((device) => ({
+    deviceId: Buffer.from(device.mlsDeviceId).toString('base64'),
+    keyPackage: Buffer.from(device.keyPackage).toString('base64'),
+  })));
+}));
+
+app.post('/api/mls/devices/:deviceId/key-package', requireAuth, route(async (req, res) => {
+  const device = await claimMlsDevice(req.params.deviceId, req.device.userId);
+  if (!device) return res.status(404).json({ error: 'MLS device or KeyPackage not found' });
+  res.json({
+    deviceId: Buffer.from(device.mlsDeviceId).toString('base64'),
+    keyPackage: Buffer.from(device.keyPackage).toString('base64'),
+  });
+}));
+
+app.post('/api/mls/envelopes', requireAuth, route(async (req, res) => {
+  const source = req.body.envelope || {};
+  if (!['Application', 'Commit', 'Welcome', 'Proposal', 'KeyPackage'].includes(source.kind)) {
+    return res.status(400).json({ error: 'Invalid MLS envelope kind' });
+  }
+  const envelope = {
+    version: Number(source.version),
+    conversationId: parseBase64(source.conversationId, 'conversationId', 64),
+    epoch: Number(source.epoch),
+    kind: source.kind,
+    senderMlsDeviceId: parseBase64(source.senderDeviceId, 'senderDeviceId', 64),
+    sequence: Number(source.sequence),
+    wallTime: Number(source.wallTime),
+    logicalTime: Number(source.logicalTime),
+    payload: parseBase64(source.payload, 'payload', 2 * 1024 * 1024),
+    contentHash: parseBase64(source.contentHash, 'contentHash', 64),
+  };
+  if (![envelope.version, envelope.epoch, envelope.sequence, envelope.wallTime, envelope.logicalTime]
+    .every(Number.isSafeInteger)) {
+    return res.status(400).json({ error: 'Invalid MLS envelope metadata' });
+  }
+  const [room, profile] = await Promise.all([
+    findMlsRoomByConversation(envelope.conversationId),
+    findMlsDeviceByServerDevice(req.device.id),
+  ]);
+  if (!room || !(await getRoomMemberIds(room.id)).includes(req.device.userId)) {
+    return res.status(403).json({ error: 'Not a room member' });
+  }
+  if (!profile || !Buffer.from(profile.mlsDeviceId).equals(envelope.senderMlsDeviceId)) {
+    return res.status(403).json({ error: 'MLS sender does not match authenticated device' });
+  }
+
+  const recipients = [...new Set(req.body.recipients || [])]
+    .map((value) => parseBase64(value, 'recipient', 64));
+  if (source.kind !== 'Welcome' && recipients.length) {
+    return res.status(400).json({ error: 'Only Welcome envelopes may have recipients' });
+  }
+  let recipientUsers = [];
+  if (recipients.length) {
+    const memberIds = new Set(await getRoomMemberIds(room.id));
+    const pendingMemberIds = new Set(await getMlsPendingMemberIds(room.id));
+    recipientUsers = await findServerUsersForMlsDevices(recipients);
+    if (recipientUsers.length !== recipients.length || recipientUsers.some((item) =>
+      !memberIds.has(item.userId) && !pendingMemberIds.has(item.userId))) {
+      return res.status(400).json({ error: 'Welcome recipient is not an active room member' });
+    }
+  }
+
+  const envelopeId = await insertMlsEnvelope(envelope, recipients);
+  if (!envelopeId) return res.status(409).json({ error: 'EpochOccupied' });
+  if (source.kind === 'Welcome') {
+    await finalizeMlsPendingMembers(room.id, recipientUsers.map((recipient) => recipient.userId));
+    io.to(`room:${room.id}`).emit('room:members-updated', {
+      roomId: room.id, members: await getRoomMembers(room.id),
+    });
+  }
+  const serialized = serializeMlsEnvelope({
+    ...envelope,
+    senderMlsDeviceId: envelope.senderMlsDeviceId,
+    sequenceNumber: envelope.sequence,
+  });
+  for (const userId of await getRoomMemberIds(room.id)) {
+    io.to(`user:${userId}`).emit('mls:envelope', serialized);
+  }
+  if (source.kind === 'Welcome') {
+    for (const recipient of recipientUsers) {
+      io.to(`user:${recipient.userId}`).emit('room:invited', { roomId: room.id });
+    }
+  }
+  res.status(201).json({ id: envelopeId });
+}));
+
+app.get('/api/mls/conversations/:conversationId/envelopes', requireAuth, route(async (req, res) => {
+  if (!/^[a-f0-9]{2,128}$/i.test(req.params.conversationId) || req.params.conversationId.length % 2) {
+    return res.status(400).json({ error: 'Invalid conversation id' });
+  }
+  const conversationId = Buffer.from(req.params.conversationId, 'hex');
+  const room = await findMlsRoomByConversation(conversationId);
+  if (!room) return res.json([]);
+  if (!(await getRoomMemberIds(room.id)).includes(req.device.userId)) {
+    return res.status(403).json({ error: 'Not a room member' });
+  }
+  let cursor;
+  try {
+    cursor = parseMlsCursor(req.query.cursor);
+  } catch {
+    return res.status(400).json({ error: 'Invalid MLS sync cursor' });
+  }
+  res.json((await listMlsEnvelopes(conversationId, cursor, req.query.limit)).map(serializeMlsEnvelope));
+}));
+
+app.get('/api/mls/welcomes', requireAuth, route(async (req, res) => {
+  const welcomes = await listPendingMlsWelcomes(req.device.id);
+  res.json(welcomes.map((row) => ({ id: Number(row.id), envelope: serializeMlsEnvelope(row) })));
+}));
+
+app.post('/api/mls/welcomes/:id/ack', requireAuth, route(async (req, res) => {
+  if (!await acknowledgeMlsWelcome(req.params.id, req.device.id)) {
+    return res.status(404).json({ error: 'Welcome not found' });
+  }
+  res.json({ ok: true });
+}));
 
 app.get('/api/rooms', requireAuth, route(async (req, res) => {
   const memberRooms = new Set(await getUserRoomIds(req.device.userId));
-  res.json((await listRooms()).filter((room) => memberRooms.has(room.id)));
+  res.json((await listRooms()).filter((room) => memberRooms.has(room.id) && room.conversationId)
+    .map((room) => ({
+      ...room,
+      conversationId: Buffer.from(room.conversationId).toString('base64'),
+      rotationRequired: false,
+    })));
 }));
 
 app.post('/api/rooms', requireAuth, route(async (req, res) => {
-  const { name, memberIds = [], encryptedDeviceKeys = {} } = req.body;
+  const { name, memberIds = [], conversationId: encodedConversationId } = req.body;
   const creatorId = req.device.userId;
-  if (!name?.trim()) return res.status(400).json({ error: 'name required' });
+  if (!name?.trim() || !encodedConversationId) return res.status(400).json({ error: 'name and conversationId required' });
   if (name.trim().length > 64) return res.status(400).json({ error: 'Room name is too long' });
   if (!await findUserById(creatorId)) return res.status(404).json({ error: 'Creator not found' });
   const uniqueMemberIds = [...new Set([creatorId, ...memberIds])];
   const users = await Promise.all(uniqueMemberIds.map((id) => findUserById(id)));
   if (users.some((user) => !user)) return res.status(400).json({ error: 'Unknown room member' });
-  const deviceGroups = await Promise.all(uniqueMemberIds.map((id) => listUserDevices(id)));
-  if (deviceGroups.some((devices) => devices.length === 0)) {
+  const profiles = await Promise.all(uniqueMemberIds.map(async (id) => {
+    const devices = await listUserDevices(id);
+    return devices.some((device) => device.status === 'active');
+  }));
+  if (profiles.some((available) => !available)) {
     return res.status(400).json({ error: 'Every room member must have an active device' });
   }
-  const activeDevices = deviceGroups.flat();
-  const activeDeviceIds = new Set(activeDevices.map((device) => device.id));
-  if (activeDevices.some((device) => !encryptedDeviceKeys[device.id])) {
-    return res.status(400).json({ error: 'A room key is required for every active device' });
-  }
-  if (Object.keys(encryptedDeviceKeys).some((deviceId) => !activeDeviceIds.has(deviceId))) {
-    return res.status(400).json({ error: 'Room key supplied for a non-member device' });
-  }
-  const memberMap = Object.fromEntries(uniqueMemberIds.map((id) => [id, null]));
-  const room = await createRoom(uuidv4(), name, creatorId, memberMap, encryptedDeviceKeys);
-  res.json({ id: room.id, name: room.name });
+  const conversationId = parseBase64(encodedConversationId, 'conversationId', 64);
+  const room = await createMlsRoom(
+    uuidv4(), name, creatorId, req.device.id, uniqueMemberIds, conversationId
+  );
+  res.json({ id: room.id, name: room.name, conversationId: encodedConversationId });
 }));
 
-app.get('/api/rooms/:roomId/devices', requireAuth, route(async (req, res) => {
+app.get('/api/rooms/:roomId', requireAuth, route(async (req, res) => {
+  const room = await findMlsRoomById(req.params.roomId);
+  if (!room || !(await getRoomMemberIds(room.id)).includes(req.device.userId)) {
+    return res.status(404).json({ error: 'Room not found' });
+  }
+  res.json({ ...room, conversationId: Buffer.from(room.conversationId).toString('base64') });
+}));
+
+app.get('/api/rooms/:roomId/members', requireAuth, route(async (req, res) => {
   if (!(await getRoomMemberIds(req.params.roomId)).includes(req.device.userId)) {
     return res.status(403).json({ error: 'Not a room member' });
   }
-  res.json(await getRoomActiveDevices(req.params.roomId));
+  res.json(await getRoomMembers(req.params.roomId));
 }));
 
 app.post('/api/rooms/:roomId/members', requireAuth, route(async (req, res) => {
   const roomId = req.params.roomId;
-  const room = await findRoomById(roomId);
+  const room = await findMlsRoomById(roomId);
   if (!room || room.creatorId !== req.device.userId) {
     return res.status(403).json({ error: 'Only the room creator can invite members' });
   }
@@ -319,42 +501,8 @@ app.post('/api/rooms/:roomId/members', requireAuth, route(async (req, res) => {
   if (!userIds.length) return res.status(400).json({ error: 'No new members selected' });
   const invitedUsers = await Promise.all(userIds.map((id) => findUserById(id)));
   if (invitedUsers.some((user) => !user)) return res.status(400).json({ error: 'Unknown user in invitation' });
-  const targetDevices = (await Promise.all(userIds.map((id) => listUserDevices(id)))).flat();
-  if (!targetDevices.length || userIds.some((id) => !targetDevices.some((device) => device.userId === id))) {
-    return res.status(400).json({ error: 'Every invited user must have an active device' });
-  }
-  const targetDeviceIds = new Set(targetDevices.map((device) => device.id));
-  const epochs = await getRoomKeyEpochs(roomId);
-  const encryptedRoomKeys = req.body.encryptedRoomKeys || [];
-  const supplied = new Set(encryptedRoomKeys.map((item) => `${item.deviceId}:${item.keyEpoch}`));
-  const complete = epochs.every((epoch) => [...targetDeviceIds].every((id) => supplied.has(`${id}:${epoch}`)));
-  const valid = encryptedRoomKeys.every((item) =>
-    targetDeviceIds.has(item.deviceId) && epochs.includes(item.keyEpoch) && item.encryptedGroupKey
-  );
-  if (!epochs.length || !complete || !valid) {
-    return res.status(400).json({ error: 'A key for every device and epoch is required' });
-  }
-  await inviteRoomMembers(roomId, userIds, encryptedRoomKeys);
-  const members = await getRoomMembers(roomId);
-  io.to(`room:${roomId}`).emit('room:members-updated', { roomId, members });
-  for (const userId of userIds) io.to(`user:${userId}`).emit('room:invited', { roomId });
-  res.json({ members });
-}));
-
-app.post('/api/rooms/:roomId/rotate-key', requireAuth, route(async (req, res) => {
-  const roomId = req.params.roomId;
-  const room = await findRoomById(roomId);
-  if (!room || !(await getRoomMemberIds(roomId)).includes(req.device.userId)) {
-    return res.status(403).json({ error: 'Not a room member' });
-  }
-  const nextEpoch = room.currentEpoch + 1;
-  if (!await rotateRoomKey(roomId, nextEpoch, req.body.encryptedDeviceKeys || {})) {
-    return res.status(409).json({ error: 'Room key rotation is incomplete or stale' });
-  }
-  for (const [deviceId, encryptedGroupKey] of Object.entries(req.body.encryptedDeviceKeys || {})) {
-    io.to(`device:${deviceId}`).emit('room:key-rotated', { roomId, keyEpoch: nextEpoch, encryptedGroupKey });
-  }
-  res.json({ keyEpoch: nextEpoch });
+  await addMlsRoomMembers(roomId, userIds, req.device.id);
+  res.status(202).json({ pendingUserIds: userIds });
 }));
 
 io.use(async (socket, next) => {
@@ -388,37 +536,15 @@ io.on('connection', async (socket) => {
 
   onSocket(socket, 'room:join', async ({ roomId }) => {
     const [room, user, memberIds] = await Promise.all([
-      findRoomById(roomId), findUserById(userId), getRoomMemberIds(roomId),
+      findMlsRoomById(roomId), findUserById(userId), getRoomMemberIds(roomId),
     ]);
     if (!room || !user || !memberIds.includes(userId)) return;
     socket.join(`room:${roomId}`);
-    const [storedKeys, messages, members] = await Promise.all([
-      getRoomDeviceKeys(roomId, deviceId), getRoomMessages(roomId), getRoomMembers(roomId),
-    ]);
-    socket.emit('room:history', {
-      roomId, messages, members, encryptedGroupKeys: storedKeys,
-      currentEpoch: room.currentEpoch, rotationRequired: room.rotationRequired,
-    });
+    const members = await getRoomMembers(roomId);
     socket.to(`room:${roomId}`).emit('room:member-joined', { userId, username: user.username, members });
-    if (!storedKeys.length) {
-      socket.to(`room:${roomId}`).emit('room:key-needed', {
-        roomId, requesterId: userId, requesterDeviceId: deviceId,
-        requesterPublicKey: socket.device.publicKey,
-      });
-    }
     io.to(`room:${roomId}`).emit('room:online', {
       roomId, onlineUserIds: await getRoomOnlineUserIds(roomId),
     });
-  });
-
-  onSocket(socket, 'room:share-key', async ({ roomId, targetDeviceId, encryptedGroupKeys }) => {
-    if (!await findRoomById(roomId) || !(await getRoomMemberIds(roomId)).includes(userId)) return;
-    const target = await findDeviceById(targetDeviceId);
-    if (!target || !(await getRoomMemberIds(roomId)).includes(target.userId)) return;
-    for (const item of encryptedGroupKeys || []) {
-      await setRoomDeviceKeys(roomId, item.keyEpoch, { [targetDeviceId]: item.encryptedGroupKey });
-    }
-    io.to(`device:${targetDeviceId}`).emit('room:key-received', { roomId, encryptedGroupKeys });
   });
 
   onSocket(socket, 'room:leave', async ({ roomId }) => {
@@ -428,25 +554,12 @@ io.on('connection', async (socket) => {
     });
   });
 
-  onSocket(socket, 'message:send', async ({ roomId, message }) => {
-    const room = await findRoomById(roomId);
-    if (!room || !(await getRoomMemberIds(roomId)).includes(userId) || room.rotationRequired) return;
-    if (message.keyEpoch !== room.currentEpoch) return;
-    const stored = {
-      id: message.id || uuidv4(), roomId, senderId: userId, senderDeviceId: deviceId,
-      senderUsername: socket.device.username, ciphertext: message.ciphertext, iv: message.iv,
-      timestamp: message.timestamp || Date.now(), keyEpoch: message.keyEpoch,
-      readBy: [{ userId, username: socket.device.username, readAt: Date.now() }],
-    };
-    await insertMessage(stored);
-    io.to(`room:${roomId}`).emit('message:new', stored);
-  });
 
   onSocket(socket, 'message:read', async ({ roomId, messageId }) => {
-    if (!await findRoomById(roomId) || !(await getRoomMemberIds(roomId)).includes(userId)) return;
-    await addMessageRead(messageId, userId, socket.device.username, Date.now());
+    if (!await findMlsRoomById(roomId) || !(await getRoomMemberIds(roomId)).includes(userId)) return;
+    await addMlsMessageRead(messageId, roomId, userId, socket.device.username, Date.now());
     io.to(`room:${roomId}`).emit('message:read-update', {
-      messageId, readBy: await getMessageReads(messageId),
+      messageId, readBy: await getMlsMessageReads(messageId),
     });
   });
 

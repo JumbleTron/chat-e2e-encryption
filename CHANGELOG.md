@@ -6,15 +6,22 @@ Projekt stosuje konwencję [Keep a Changelog](https://keepachangelog.com/) i wer
 
 ### Added
 
-- szyfrowany czat grupowy AES-256-GCM,
-- osobne klucze RSA-OAEP i sesje dla urządzeń,
-- parowanie oraz wycofywanie urządzeń,
-- epoki kluczy i rotacja po wycofaniu urządzenia,
-- zapraszanie do istniejących pokojów z dostępem do historii,
-- zaszyfrowany vault odzyskiwania,
-- MySQL 8 z transakcjami InnoDB,
-- kontenery Docker, reverse proxy Nginx i healthchecki,
-- test integracyjny MySQL + Socket.IO + Web Crypto.
+- grupy MLS oparte na OpenMLS/WASM,
+- jednorazowe i last-resort KeyPackage dla urządzeń,
+- Delivery Service przechowujący Commit, Welcome, Proposal i PrivateMessage,
+- szyfrowany magazyn stanu MLS i lokalnej historii w IndexedDB,
+- test dwóch izolowanych klientów przeglądarkowych.
+
+### Changed
+
+- zastąpiono współdzielone klucze AES pokojów protokołem MLS,
+- zaproszeni użytkownicy otrzymują dostęp od nowej epoki, bez starej historii,
+- backup odzyskiwania nie zawiera historycznych sekretów grup.
+
+### Removed
+
+- `room_device_keys`, ręczna rotacja kluczy i endpointy przekazywania kluczy,
+- serwerowa ścieżka wiadomości AES-GCM.
 
 ## [1.0.0] - 2026-07-20
 

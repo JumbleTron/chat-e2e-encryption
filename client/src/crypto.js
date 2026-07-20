@@ -3,7 +3,6 @@ const STORAGE_KEYS = {
   username: 'e2e_chat_username',
   privateKey: 'e2e_chat_privateKey',
   publicKey: 'e2e_chat_publicKey',
-  groupKeys: 'e2e_chat_groupKeys',
   deviceId: 'e2e_chat_deviceId',
   deviceName: 'e2e_chat_deviceName',
   authToken: 'e2e_chat_authToken',
@@ -101,58 +100,20 @@ export async function importPrivateKey(base64) {
   );
 }
 
-export async function generateGroupKey() {
-  return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
-}
-
-export async function exportGroupKey(key) {
-  const exported = await crypto.subtle.exportKey('raw', key);
-  return arrayBufferToBase64(exported);
-}
-
-export async function importGroupKey(base64) {
-  return crypto.subtle.importKey(
-    'raw',
-    base64ToArrayBuffer(base64),
-    { name: 'AES-GCM' },
-    true,
-    ['encrypt', 'decrypt']
-  );
-}
-
-export async function encryptGroupKeyForUser(groupKeyBase64, recipientPublicKeyBase64) {
+export async function encryptForDevice(plaintextBase64, recipientPublicKeyBase64) {
   const publicKey = await importPublicKey(recipientPublicKeyBase64);
-  const rawKey = base64ToArrayBuffer(groupKeyBase64);
-  const encrypted = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, publicKey, rawKey);
+  const plaintext = base64ToArrayBuffer(plaintextBase64);
+  const encrypted = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, publicKey, plaintext);
   return arrayBufferToBase64(encrypted);
 }
 
-export async function decryptGroupKey(encryptedBase64, privateKey) {
+export async function decryptFromDevice(encryptedBase64, privateKey) {
   const decrypted = await crypto.subtle.decrypt(
     { name: 'RSA-OAEP' },
     privateKey,
     base64ToArrayBuffer(encryptedBase64)
   );
   return arrayBufferToBase64(decrypted);
-}
-
-export async function encryptMessage(plaintext, groupKey) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoded = new TextEncoder().encode(plaintext);
-  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, groupKey, encoded);
-  return {
-    ciphertext: arrayBufferToBase64(ciphertext),
-    iv: arrayBufferToBase64(iv),
-  };
-}
-
-export async function decryptMessage(ciphertextBase64, ivBase64, groupKey) {
-  const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: base64ToArrayBuffer(ivBase64) },
-    groupKey,
-    base64ToArrayBuffer(ciphertextBase64)
-  );
-  return new TextDecoder().decode(decrypted);
 }
 
 export function generateAuthToken() {
@@ -193,29 +154,7 @@ export function loadSession() {
 export function clearSession() {
   Object.values(STORAGE_KEYS).forEach((k) => localStorage.removeItem(k));
   deleteStoredKeys().catch(() => {});
-}
-
-export function saveRoomGroupKey(roomId, groupKeyBase64, keyEpoch = 1) {
-  const keys = JSON.parse(localStorage.getItem(STORAGE_KEYS.groupKeys) || '{}');
-  const existing = keys[roomId];
-  if (typeof existing === 'string') keys[roomId] = { 1: existing };
-  if (!keys[roomId]) keys[roomId] = {};
-  keys[roomId][keyEpoch] = groupKeyBase64;
-  localStorage.setItem(STORAGE_KEYS.groupKeys, JSON.stringify(keys));
-}
-
-export function getRoomGroupKeys(roomId) {
-  const keys = JSON.parse(localStorage.getItem(STORAGE_KEYS.groupKeys) || '{}');
-  const roomKeys = keys[roomId];
-  if (!roomKeys) return {};
-  return typeof roomKeys === 'string' ? { 1: roomKeys } : roomKeys;
-}
-
-export function getRoomGroupKey(roomId, keyEpoch = null) {
-  const roomKeys = getRoomGroupKeys(roomId);
-  if (keyEpoch !== null) return roomKeys[keyEpoch] || null;
-  const epochs = Object.keys(roomKeys).map(Number).sort((a, b) => b - a);
-  return epochs.length ? roomKeys[epochs[0]] : null;
+  indexedDB.deleteDatabase('message_app_mls');
 }
 
 export async function loadPrivateKey() {

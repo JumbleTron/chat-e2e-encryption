@@ -61,7 +61,7 @@ export default function LoginScreen({ onLogin }) {
       <div className="login-card">
         <div className="lock-icon" aria-hidden="true">E2E</div>
         <h1>Secure Group Chat</h1>
-        <p className="subtitle">Każde urządzenie ma własny klucz szyfrujący</p>
+        <p className="subtitle">Forward secrecy i członkostwo urządzeń przez MLS</p>
 
         <div className="mode-tabs" role="tablist">
           <button className={mode === 'register' ? 'active' : ''} onClick={() => changeMode('register')}>

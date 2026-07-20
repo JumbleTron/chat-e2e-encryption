@@ -1,4 +1,5 @@
 import mysql from 'mysql2/promise';
+import { createHash } from 'crypto';
 
 const config = {
   host: process.env.DB_HOST || '127.0.0.1',
@@ -48,12 +49,22 @@ const schemaStatements = [
   `CREATE TABLE IF NOT EXISTS room_members (
     room_id VARCHAR(36) NOT NULL,
     user_id VARCHAR(36) NOT NULL,
-    encrypted_group_key LONGTEXT NULL,
     joined_at BIGINT NOT NULL,
     PRIMARY KEY (room_id, user_id),
     INDEX idx_room_members_user (user_id),
     CONSTRAINT fk_room_members_room FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
     CONSTRAINT fk_room_members_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+  `CREATE TABLE IF NOT EXISTS room_pending_members (
+    room_id VARCHAR(36) NOT NULL,
+    user_id VARCHAR(36) NOT NULL,
+    invited_by_device_id VARCHAR(36) NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (room_id, user_id),
+    CONSTRAINT fk_pending_member_room FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
+    CONSTRAINT fk_pending_member_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_pending_member_inviter FOREIGN KEY (invited_by_device_id)
+      REFERENCES user_devices(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
   `CREATE TABLE IF NOT EXISTS device_link_requests (
     id VARCHAR(36) PRIMARY KEY,
@@ -65,41 +76,6 @@ const schemaStatements = [
     CONSTRAINT fk_link_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     CONSTRAINT fk_link_device FOREIGN KEY (device_id) REFERENCES user_devices(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-  `CREATE TABLE IF NOT EXISTS room_device_keys (
-    room_id VARCHAR(36) NOT NULL,
-    device_id VARCHAR(36) NOT NULL,
-    key_epoch INT NOT NULL DEFAULT 1,
-    encrypted_group_key LONGTEXT NOT NULL,
-    created_at BIGINT NOT NULL,
-    PRIMARY KEY (room_id, device_id, key_epoch),
-    INDEX idx_room_device_keys_device (device_id, room_id),
-    CONSTRAINT fk_room_keys_room FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-    CONSTRAINT fk_room_keys_device FOREIGN KEY (device_id) REFERENCES user_devices(id) ON DELETE CASCADE
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-  `CREATE TABLE IF NOT EXISTS messages (
-    id VARCHAR(36) PRIMARY KEY,
-    room_id VARCHAR(36) NOT NULL,
-    sender_id VARCHAR(36) NOT NULL,
-    sender_username VARCHAR(32) NOT NULL,
-    sender_device_id VARCHAR(36) NULL,
-    ciphertext LONGTEXT NOT NULL,
-    iv TEXT NOT NULL,
-    timestamp BIGINT NOT NULL,
-    key_epoch INT NOT NULL DEFAULT 1,
-    INDEX idx_messages_room_timestamp (room_id, timestamp),
-    CONSTRAINT fk_messages_room FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-    CONSTRAINT fk_messages_sender FOREIGN KEY (sender_id) REFERENCES users(id),
-    CONSTRAINT fk_messages_device FOREIGN KEY (sender_device_id) REFERENCES user_devices(id) ON DELETE SET NULL
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-  `CREATE TABLE IF NOT EXISTS message_reads (
-    message_id VARCHAR(36) NOT NULL,
-    user_id VARCHAR(36) NOT NULL,
-    username VARCHAR(32) NOT NULL,
-    read_at BIGINT NOT NULL,
-    PRIMARY KEY (message_id, user_id),
-    CONSTRAINT fk_reads_message FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
-    CONSTRAINT fk_reads_user FOREIGN KEY (user_id) REFERENCES users(id)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
   `CREATE TABLE IF NOT EXISTS recovery_backups (
     user_id VARCHAR(36) PRIMARY KEY,
     ciphertext LONGTEXT NOT NULL,
@@ -107,6 +83,80 @@ const schemaStatements = [
     recovery_auth_hash CHAR(64) NOT NULL,
     updated_at BIGINT NOT NULL,
     CONSTRAINT fk_recovery_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+  `CREATE TABLE IF NOT EXISTS mls_user_profiles (
+    user_id VARCHAR(36) PRIMARY KEY,
+    mls_user_id VARBINARY(64) NOT NULL UNIQUE,
+    created_at BIGINT NOT NULL,
+    CONSTRAINT fk_mls_user_profile FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+  `CREATE TABLE IF NOT EXISTS mls_device_profiles (
+    device_id VARCHAR(36) PRIMARY KEY,
+    mls_device_id VARBINARY(64) NOT NULL UNIQUE,
+    created_at BIGINT NOT NULL,
+    CONSTRAINT fk_mls_device_profile FOREIGN KEY (device_id) REFERENCES user_devices(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+  `CREATE TABLE IF NOT EXISTS mls_key_packages (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    device_id VARCHAR(36) NOT NULL,
+    package_hash CHAR(64) NOT NULL UNIQUE,
+    key_package LONGBLOB NOT NULL,
+    is_last_resort BOOLEAN NOT NULL DEFAULT FALSE,
+    claimed_at BIGINT NULL,
+    created_at BIGINT NOT NULL,
+    INDEX idx_mls_packages_available (device_id, is_last_resort, claimed_at),
+    CONSTRAINT fk_mls_package_device FOREIGN KEY (device_id) REFERENCES user_devices(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+  `CREATE TABLE IF NOT EXISTS mls_conversations (
+    room_id VARCHAR(36) PRIMARY KEY,
+    conversation_id VARBINARY(64) NOT NULL UNIQUE,
+    created_at BIGINT NOT NULL,
+    CONSTRAINT fk_mls_conversation_room FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+  `CREATE TABLE IF NOT EXISTS mls_envelopes (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    conversation_id VARBINARY(64) NOT NULL,
+    version SMALLINT UNSIGNED NOT NULL,
+    epoch BIGINT UNSIGNED NOT NULL,
+    kind ENUM('Application', 'Commit', 'Welcome', 'Proposal', 'KeyPackage') NOT NULL,
+    sender_mls_device_id VARBINARY(64) NOT NULL,
+    sequence_number BIGINT UNSIGNED NOT NULL,
+    wall_time BIGINT NOT NULL,
+    logical_time INT UNSIGNED NOT NULL,
+    payload LONGBLOB NOT NULL,
+    content_hash VARBINARY(64) NOT NULL,
+    created_at BIGINT NOT NULL,
+    UNIQUE KEY uq_mls_sender_sequence (conversation_id, sender_mls_device_id, sequence_number, kind),
+    INDEX idx_mls_envelopes_sync (conversation_id, id),
+    CONSTRAINT fk_mls_envelope_conversation FOREIGN KEY (conversation_id)
+      REFERENCES mls_conversations(conversation_id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+  `CREATE TABLE IF NOT EXISTS mls_envelope_recipients (
+    envelope_id BIGINT UNSIGNED NOT NULL,
+    mls_device_id VARBINARY(64) NOT NULL,
+    acknowledged_at BIGINT NULL,
+    PRIMARY KEY (envelope_id, mls_device_id),
+    INDEX idx_mls_welcome_recipient (mls_device_id, acknowledged_at),
+    CONSTRAINT fk_mls_recipient_envelope FOREIGN KEY (envelope_id) REFERENCES mls_envelopes(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+  `CREATE TABLE IF NOT EXISTS mls_message_reads (
+    message_id VARCHAR(36) NOT NULL,
+    room_id VARCHAR(36) NOT NULL,
+    user_id VARCHAR(36) NOT NULL,
+    username VARCHAR(32) NOT NULL,
+    read_at BIGINT NOT NULL,
+    PRIMARY KEY (message_id, user_id),
+    INDEX idx_mls_reads_room (room_id, message_id),
+    CONSTRAINT fk_mls_reads_room FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
+    CONSTRAINT fk_mls_reads_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+  `CREATE TABLE IF NOT EXISTS mls_device_link_secrets (
+    request_id VARCHAR(36) PRIMARY KEY,
+    encrypted_identity LONGTEXT NOT NULL,
+    approving_device_id VARCHAR(36) NOT NULL,
+    created_at BIGINT NOT NULL,
+    CONSTRAINT fk_mls_link_request FOREIGN KEY (request_id) REFERENCES device_link_requests(id) ON DELETE CASCADE,
+    CONSTRAINT fk_mls_link_approver FOREIGN KEY (approving_device_id) REFERENCES user_devices(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 ];
 
@@ -181,12 +231,16 @@ export async function createUser(id, username, publicKey) {
 }
 
 export async function listUsers() {
-  const users = await rows('SELECT id, username FROM users ORDER BY username');
+  const users = await rows(
+    `SELECT u.id, u.username, up.mls_user_id AS mlsUserId
+     FROM users u LEFT JOIN mls_user_profiles up ON up.user_id = u.id ORDER BY u.username`
+  );
   return Promise.all(users.map(async (user) => ({
     ...user,
     devices: await rows(
-      `SELECT id, name, public_key AS publicKey FROM user_devices
-       WHERE user_id = ? AND status = 'active' ORDER BY created_at`,
+      `SELECT d.id, d.name, d.public_key AS publicKey, dp.mls_device_id AS mlsDeviceId
+       FROM user_devices d LEFT JOIN mls_device_profiles dp ON dp.device_id = d.id
+       WHERE d.user_id = ? AND d.status = 'active' ORDER BY d.created_at`,
       [user.id]
     ),
   })));
@@ -250,12 +304,10 @@ export function revokeDevice(deviceId, userId) {
     if (Number(countRow.count) <= 1) throw new Error('LAST_DEVICE');
     await connection.query("UPDATE user_devices SET status = 'revoked' WHERE id = ?", [deviceId]);
     const roomRows = await rows(
-      'SELECT DISTINCT room_id AS roomId FROM room_device_keys WHERE device_id = ?',
-      [deviceId], connection
+      `SELECT rm.room_id AS roomId FROM room_members rm
+       JOIN mls_conversations mc ON mc.room_id = rm.room_id WHERE rm.user_id = ?`,
+      [userId], connection
     );
-    for (const room of roomRows) {
-      await connection.query('UPDATE rooms SET rotation_required = TRUE WHERE id = ?', [room.roomId]);
-    }
     return roomRows.map((room) => room.roomId);
   });
 }
@@ -272,9 +324,31 @@ export function findLinkRequest(id) {
   return first(
     `SELECT lr.id, lr.user_id AS userId, lr.device_id AS deviceId,
             lr.verification_code AS verificationCode, lr.expires_at AS expiresAt,
-            d.name AS deviceName, d.public_key AS publicKey, d.status
+            d.name AS deviceName, d.public_key AS publicKey, d.status,
+            ls.encrypted_identity AS encryptedMlsIdentity,
+            ls.approving_device_id AS approvingDeviceId
      FROM device_link_requests lr JOIN user_devices d ON d.id = lr.device_id
+     LEFT JOIN mls_device_link_secrets ls ON ls.request_id = lr.id
      WHERE lr.id = ?`, [id]
+  );
+}
+
+export async function saveMlsLinkSecret(requestId, encryptedIdentity, approvingDeviceId) {
+  await pool.query(
+    `INSERT INTO mls_device_link_secrets
+     (request_id, encrypted_identity, approving_device_id, created_at) VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE encrypted_identity = VALUES(encrypted_identity),
+       approving_device_id = VALUES(approving_device_id), created_at = VALUES(created_at)`,
+    [requestId, encryptedIdentity, approvingDeviceId, Date.now()]
+  );
+}
+
+export function getMlsLinkApprover(deviceId) {
+  return first(
+    `SELECT ls.approving_device_id AS approvingDeviceId
+     FROM device_link_requests lr
+     JOIN mls_device_link_secrets ls ON ls.request_id = lr.id
+     WHERE lr.device_id = ?`, [deviceId]
   );
 }
 
@@ -308,44 +382,17 @@ export function getRecoveryBackup(userId) {
 export async function listRooms() {
   const result = await rows(
     `SELECT r.id, r.name, r.creator_id AS creatorId, r.current_epoch AS currentEpoch,
-            r.rotation_required AS rotationRequired, COUNT(rm.user_id) AS memberCount
+            r.rotation_required AS rotationRequired, COUNT(rm.user_id) AS memberCount,
+            mc.conversation_id AS conversationId
      FROM rooms r LEFT JOIN room_members rm ON rm.room_id = r.id
-     GROUP BY r.id, r.name, r.creator_id, r.current_epoch, r.rotation_required, r.created_at
+     LEFT JOIN mls_conversations mc ON mc.room_id = r.id
+     GROUP BY r.id, r.name, r.creator_id, r.current_epoch, r.rotation_required,
+              r.created_at, mc.conversation_id
      ORDER BY r.created_at DESC`
   );
   return result.map((room) => ({
     ...room, memberCount: Number(room.memberCount), rotationRequired: Boolean(room.rotationRequired),
   }));
-}
-
-export function createRoom(id, name, creatorId, encryptedGroupKeys = {}, encryptedDeviceKeys = {}) {
-  return withTransaction(async (connection) => {
-    const normalized = name.trim();
-    const timestamp = Date.now();
-    await connection.query(
-      'INSERT INTO rooms (id, name, creator_id, current_epoch, rotation_required, created_at) VALUES (?, ?, ?, 1, FALSE, ?)',
-      [id, normalized, creatorId, timestamp]
-    );
-    for (const userId of new Set([creatorId, ...Object.keys(encryptedGroupKeys)])) {
-      await connection.query(
-        `INSERT INTO room_members (room_id, user_id, encrypted_group_key, joined_at)
-         VALUES (?, ?, ?, ?)`,
-        [id, userId, encryptedGroupKeys[userId] || null, timestamp]
-      );
-    }
-    for (const [deviceId, encryptedKey] of Object.entries(encryptedDeviceKeys)) {
-      await upsertRoomDeviceKey(connection, id, deviceId, 1, encryptedKey);
-    }
-    return { id, name: normalized };
-  });
-}
-
-export async function findRoomById(roomId) {
-  const room = await first(
-    `SELECT id, name, creator_id AS creatorId, current_epoch AS currentEpoch,
-            rotation_required AS rotationRequired FROM rooms WHERE id = ?`, [roomId]
-  );
-  return room ? { ...room, rotationRequired: Boolean(room.rotationRequired) } : null;
 }
 
 export async function getRoomMemberIds(roomId, executor = pool) {
@@ -367,147 +414,9 @@ export async function getRoomMembers(roomId) {
   })));
 }
 
-export function getRoomActiveDevices(roomId, executor = pool) {
-  return rows(
-    `SELECT d.id, d.user_id AS userId, d.name, d.public_key AS publicKey
-     FROM room_members rm JOIN user_devices d ON d.user_id = rm.user_id
-     WHERE rm.room_id = ? AND d.status = 'active' ORDER BY d.created_at`, [roomId], executor
-  );
-}
-
-export async function getRoomKeyEpochs(roomId) {
-  const result = await rows(
-    'SELECT DISTINCT key_epoch AS keyEpoch FROM room_device_keys WHERE room_id = ? ORDER BY key_epoch', [roomId]
-  );
-  return result.map((row) => row.keyEpoch);
-}
-
-export function inviteRoomMembers(roomId, userIds, encryptedRoomKeys) {
-  return withTransaction(async (connection) => {
-    const timestamp = Date.now();
-    for (const userId of userIds) {
-      await connection.query(
-        `INSERT IGNORE INTO room_members (room_id, user_id, encrypted_group_key, joined_at)
-         VALUES (?, ?, NULL, ?)`, [roomId, userId, timestamp]
-      );
-    }
-    for (const item of encryptedRoomKeys) {
-      await upsertRoomDeviceKey(connection, roomId, item.deviceId, item.keyEpoch, item.encryptedGroupKey);
-    }
-  });
-}
-
-async function upsertRoomDeviceKey(executor, roomId, deviceId, keyEpoch, encryptedGroupKey) {
-  await executor.query(
-    `INSERT INTO room_device_keys
-     (room_id, device_id, key_epoch, encrypted_group_key, created_at) VALUES (?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE encrypted_group_key = VALUES(encrypted_group_key)`,
-    [roomId, deviceId, keyEpoch, encryptedGroupKey, Date.now()]
-  );
-}
-
-export async function setRoomDeviceKeys(roomId, keyEpoch, encryptedDeviceKeys, executor = pool) {
-  for (const [deviceId, encryptedKey] of Object.entries(encryptedDeviceKeys)) {
-    await upsertRoomDeviceKey(executor, roomId, deviceId, keyEpoch, encryptedKey);
-  }
-}
-
-export function getRoomDeviceKeys(roomId, deviceId) {
-  return rows(
-    `SELECT key_epoch AS keyEpoch, encrypted_group_key AS encryptedGroupKey
-     FROM room_device_keys WHERE room_id = ? AND device_id = ? ORDER BY key_epoch`,
-    [roomId, deviceId]
-  );
-}
-
-export function getAllDeviceRoomKeys(deviceId) {
-  return rows(
-    `SELECT room_id AS roomId, key_epoch AS keyEpoch, encrypted_group_key AS encryptedGroupKey
-     FROM room_device_keys WHERE device_id = ? ORDER BY room_id, key_epoch`, [deviceId]
-  );
-}
-
-export async function copyLegacyRoomKeysToDevice(userId, deviceId) {
-  await pool.query(
-    `INSERT IGNORE INTO room_device_keys
-     (room_id, device_id, key_epoch, encrypted_group_key, created_at)
-     SELECT room_id, ?, 1, encrypted_group_key, ? FROM room_members
-     WHERE user_id = ? AND encrypted_group_key IS NOT NULL`, [deviceId, Date.now(), userId]
-  );
-}
-
-export function rotateRoomKey(roomId, expectedEpoch, encryptedDeviceKeys) {
-  return withTransaction(async (connection) => {
-    const room = await first(
-      'SELECT current_epoch AS currentEpoch FROM rooms WHERE id = ? FOR UPDATE', [roomId], connection
-    );
-    if (!room || room.currentEpoch !== expectedEpoch - 1) return false;
-    const devices = await getRoomActiveDevices(roomId, connection);
-    const allowed = new Set(devices.map((device) => device.id));
-    if (!allowed.size || [...allowed].some((id) => !encryptedDeviceKeys[id])) return false;
-    if (Object.keys(encryptedDeviceKeys).some((id) => !allowed.has(id))) return false;
-    await setRoomDeviceKeys(roomId, expectedEpoch, encryptedDeviceKeys, connection);
-    await connection.query(
-      'UPDATE rooms SET current_epoch = ?, rotation_required = FALSE WHERE id = ?', [expectedEpoch, roomId]
-    );
-    return true;
-  });
-}
-
 export async function getUserRoomIds(userId) {
   const result = await rows('SELECT room_id AS roomId FROM room_members WHERE user_id = ?', [userId]);
   return result.map((row) => row.roomId);
-}
-
-export async function getRoomMessages(roomId) {
-  const messages = await rows(
-    `SELECT id, room_id AS roomId, sender_id AS senderId, sender_username AS senderUsername,
-            ciphertext, iv, timestamp, key_epoch AS keyEpoch, sender_device_id AS senderDeviceId
-     FROM messages WHERE room_id = ? ORDER BY timestamp`, [roomId]
-  );
-  return Promise.all(messages.map(async (message) => ({
-    ...message,
-    readBy: await rows(
-      `SELECT user_id AS userId, username, read_at AS readAt
-       FROM message_reads WHERE message_id = ?`, [message.id]
-    ),
-  })));
-}
-
-export function insertMessage(message) {
-  return withTransaction(async (connection) => {
-    const {
-      id, roomId, senderId, senderUsername, senderDeviceId,
-      ciphertext, iv, timestamp, keyEpoch, readBy,
-    } = message;
-    await connection.query(
-      `INSERT INTO messages
-       (id, room_id, sender_id, sender_username, sender_device_id, ciphertext, iv, timestamp, key_epoch)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, roomId, senderId, senderUsername, senderDeviceId, ciphertext, iv, timestamp, keyEpoch]
-    );
-    for (const read of readBy) {
-      await connection.query(
-        `INSERT IGNORE INTO message_reads (message_id, user_id, username, read_at)
-         VALUES (?, ?, ?, ?)`, [id, read.userId, read.username, read.readAt]
-      );
-    }
-    return message;
-  });
-}
-
-export async function addMessageRead(messageId, userId, username, readAt) {
-  await pool.query(
-    `INSERT IGNORE INTO message_reads (message_id, user_id, username, read_at)
-     VALUES (?, ?, ?, ?)`, [messageId, userId, username, readAt]
-  );
-}
-
-export function getMessageReads(messageId) {
-  return rows(
-    'SELECT user_id AS userId, username, read_at AS readAt FROM message_reads WHERE message_id = ?',
-    [messageId]
-  );
 }
 
 export function getDbDescription() {
@@ -516,6 +425,328 @@ export function getDbDescription() {
 
 export async function closeDatabase() {
   await pool.end();
+}
+
+export function getMlsProfile(deviceId) {
+  return first(
+    `SELECT up.mls_user_id AS mlsUserId, dp.mls_device_id AS mlsDeviceId,
+            (SELECT COUNT(*) FROM mls_key_packages kp
+             WHERE kp.device_id = d.id AND kp.claimed_at IS NULL AND kp.is_last_resort = FALSE) AS availablePackages
+     FROM user_devices d
+     LEFT JOIN mls_user_profiles up ON up.user_id = d.user_id
+     LEFT JOIN mls_device_profiles dp ON dp.device_id = d.id
+     WHERE d.id = ?`,
+    [deviceId]
+  );
+}
+
+export function registerMlsProfile({ userId, deviceId, mlsUserId, mlsDeviceId }) {
+  return withTransaction(async (connection) => {
+    const existingUser = await first(
+      'SELECT mls_user_id AS mlsUserId FROM mls_user_profiles WHERE user_id = ? FOR UPDATE',
+      [userId], connection
+    );
+    if (existingUser && !Buffer.from(existingUser.mlsUserId).equals(mlsUserId)) {
+      throw new Error('MLS_USER_ID_MISMATCH');
+    }
+    const existingDevice = await first(
+      'SELECT mls_device_id AS mlsDeviceId FROM mls_device_profiles WHERE device_id = ? FOR UPDATE',
+      [deviceId], connection
+    );
+    if (existingDevice && !Buffer.from(existingDevice.mlsDeviceId).equals(mlsDeviceId)) {
+      throw new Error('MLS_DEVICE_ID_MISMATCH');
+    }
+    await connection.query(
+      `INSERT IGNORE INTO mls_user_profiles (user_id, mls_user_id, created_at) VALUES (?, ?, ?)`,
+      [userId, mlsUserId, Date.now()]
+    );
+    await connection.query(
+      `INSERT IGNORE INTO mls_device_profiles (device_id, mls_device_id, created_at) VALUES (?, ?, ?)`,
+      [deviceId, mlsDeviceId, Date.now()]
+    );
+  });
+}
+
+export async function addMlsKeyPackages(deviceId, keyPackages, lastResortKeyPackage = null) {
+  const values = keyPackages.map((keyPackage) => ({ keyPackage, lastResort: false }));
+  if (lastResortKeyPackage) values.push({ keyPackage: lastResortKeyPackage, lastResort: true });
+  for (const item of values) {
+    const hash = createHash('sha256').update(item.keyPackage).digest('hex');
+    await pool.query(
+      `INSERT IGNORE INTO mls_key_packages
+       (device_id, package_hash, key_package, is_last_resort, created_at) VALUES (?, ?, ?, ?, ?)`,
+      [deviceId, hash, item.keyPackage, item.lastResort, Date.now()]
+    );
+  }
+}
+
+export function claimMlsDevices(mlsUserId) {
+  return withTransaction(async (connection) => {
+    const devices = await rows(
+      `SELECT d.id AS deviceId, dp.mls_device_id AS mlsDeviceId
+       FROM mls_user_profiles up
+       JOIN user_devices d ON d.user_id = up.user_id AND d.status = 'active'
+       JOIN mls_device_profiles dp ON dp.device_id = d.id
+       WHERE up.mls_user_id = ? FOR UPDATE`,
+      [mlsUserId], connection
+    );
+    const result = [];
+    for (const device of devices) {
+      let keyPackage = await first(
+        `SELECT id, key_package AS keyPackage, is_last_resort AS isLastResort
+         FROM mls_key_packages
+         WHERE device_id = ? AND claimed_at IS NULL AND is_last_resort = FALSE
+         ORDER BY id LIMIT 1 FOR UPDATE`, [device.deviceId], connection
+      );
+      if (!keyPackage) {
+        keyPackage = await first(
+          `SELECT id, key_package AS keyPackage, is_last_resort AS isLastResort
+           FROM mls_key_packages WHERE device_id = ? AND is_last_resort = TRUE
+           ORDER BY id DESC LIMIT 1`, [device.deviceId], connection
+        );
+      }
+      if (!keyPackage) continue;
+      if (!keyPackage.isLastResort) {
+        await connection.query('UPDATE mls_key_packages SET claimed_at = ? WHERE id = ?', [Date.now(), keyPackage.id]);
+      }
+      result.push({ mlsDeviceId: device.mlsDeviceId, keyPackage: keyPackage.keyPackage });
+    }
+    return result;
+  });
+}
+
+export function claimMlsDevice(deviceId, userId) {
+  return withTransaction(async (connection) => {
+    const device = await first(
+      `SELECT dp.mls_device_id AS mlsDeviceId FROM user_devices d
+       JOIN mls_device_profiles dp ON dp.device_id = d.id
+       WHERE d.id = ? AND d.user_id = ? AND d.status = 'active' FOR UPDATE`,
+      [deviceId, userId], connection
+    );
+    if (!device) return null;
+    let keyPackage = await first(
+      `SELECT id, key_package AS keyPackage, is_last_resort AS isLastResort
+       FROM mls_key_packages WHERE device_id = ? AND claimed_at IS NULL AND is_last_resort = FALSE
+       ORDER BY id LIMIT 1 FOR UPDATE`, [deviceId], connection
+    );
+    if (!keyPackage) {
+      keyPackage = await first(
+        `SELECT id, key_package AS keyPackage, is_last_resort AS isLastResort
+         FROM mls_key_packages WHERE device_id = ? AND is_last_resort = TRUE ORDER BY id DESC LIMIT 1`,
+        [deviceId], connection
+      );
+    }
+    if (!keyPackage) return null;
+    if (!keyPackage.isLastResort) {
+      await connection.query('UPDATE mls_key_packages SET claimed_at = ? WHERE id = ?', [Date.now(), keyPackage.id]);
+    }
+    return { ...device, keyPackage: keyPackage.keyPackage };
+  });
+}
+
+export function createMlsRoom(id, name, creatorId, creatorDeviceId, memberIds, conversationId) {
+  return withTransaction(async (connection) => {
+    const timestamp = Date.now();
+    await connection.query(
+      'INSERT INTO rooms (id, name, creator_id, current_epoch, rotation_required, created_at) VALUES (?, ?, ?, 0, FALSE, ?)',
+      [id, name.trim(), creatorId, timestamp]
+    );
+    await connection.query(
+      `INSERT INTO room_members (room_id, user_id, joined_at) VALUES (?, ?, ?)`,
+      [id, creatorId, timestamp]
+    );
+    for (const userId of new Set(memberIds.filter((memberId) => memberId !== creatorId))) {
+      await connection.query(
+        `INSERT INTO room_pending_members (room_id, user_id, invited_by_device_id, created_at)
+         VALUES (?, ?, ?, ?)`, [id, userId, creatorDeviceId, timestamp]
+      );
+    }
+    await connection.query(
+      'INSERT INTO mls_conversations (room_id, conversation_id, created_at) VALUES (?, ?, ?)',
+      [id, conversationId, timestamp]
+    );
+    return { id, name: name.trim(), conversationId };
+  });
+}
+
+export async function findMlsRoomById(roomId) {
+  const room = await first(
+    `SELECT r.id, r.name, r.creator_id AS creatorId, r.current_epoch AS currentEpoch,
+            mc.conversation_id AS conversationId
+     FROM rooms r JOIN mls_conversations mc ON mc.room_id = r.id WHERE r.id = ?`, [roomId]
+  );
+  return room || null;
+}
+
+export function findMlsRoomByConversation(conversationId) {
+  return first(
+    `SELECT r.id, r.name, r.creator_id AS creatorId, r.current_epoch AS currentEpoch,
+            mc.conversation_id AS conversationId
+     FROM mls_conversations mc JOIN rooms r ON r.id = mc.room_id
+     WHERE mc.conversation_id = ?`, [conversationId]
+  );
+}
+
+export async function addMlsRoomMembers(roomId, userIds, invitingDeviceId) {
+  for (const userId of userIds) {
+    await pool.query(
+      `INSERT IGNORE INTO room_pending_members
+       (room_id, user_id, invited_by_device_id, created_at) VALUES (?, ?, ?, ?)`,
+      [roomId, userId, invitingDeviceId, Date.now()]
+    );
+  }
+}
+
+export async function getMlsPendingMemberIds(roomId) {
+  const result = await rows(
+    'SELECT user_id AS userId FROM room_pending_members WHERE room_id = ?', [roomId]
+  );
+  return result.map((row) => row.userId);
+}
+
+export function finalizeMlsPendingMembers(roomId, userIds) {
+  return withTransaction(async (connection) => {
+    const timestamp = Date.now();
+    for (const userId of new Set(userIds)) {
+      const pending = await first(
+        `SELECT user_id AS userId FROM room_pending_members
+         WHERE room_id = ? AND user_id = ? FOR UPDATE`, [roomId, userId], connection
+      );
+      if (!pending) continue;
+      await connection.query(
+        `INSERT IGNORE INTO room_members (room_id, user_id, joined_at) VALUES (?, ?, ?)`,
+        [roomId, userId, timestamp]
+      );
+      await connection.query(
+        'DELETE FROM room_pending_members WHERE room_id = ? AND user_id = ?', [roomId, userId]
+      );
+    }
+  });
+}
+
+export function insertMlsEnvelope(envelope, recipientMlsDeviceIds = []) {
+  return withTransaction(async (connection) => {
+    if (envelope.kind === 'Commit') {
+      const existing = await first(
+        `SELECT id FROM mls_envelopes
+         WHERE conversation_id = ? AND epoch = ? AND kind = 'Commit' FOR UPDATE`,
+        [envelope.conversationId, envelope.epoch], connection
+      );
+      if (existing) return null;
+    }
+    const [result] = await connection.query(
+      `INSERT INTO mls_envelopes
+       (conversation_id, version, epoch, kind, sender_mls_device_id, sequence_number,
+        wall_time, logical_time, payload, content_hash, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        envelope.conversationId, envelope.version, envelope.epoch, envelope.kind,
+        envelope.senderMlsDeviceId, envelope.sequence, envelope.wallTime,
+        envelope.logicalTime, envelope.payload, envelope.contentHash, Date.now(),
+      ]
+    );
+    for (const recipient of recipientMlsDeviceIds) {
+      await connection.query(
+        `INSERT IGNORE INTO mls_envelope_recipients (envelope_id, mls_device_id)
+         VALUES (?, ?)`, [result.insertId, recipient]
+      );
+    }
+    if (envelope.kind === 'Commit') {
+      await connection.query(
+        `UPDATE rooms r JOIN mls_conversations mc ON mc.room_id = r.id
+         SET r.current_epoch = GREATEST(r.current_epoch, ?) WHERE mc.conversation_id = ?`,
+        [envelope.epoch, envelope.conversationId]
+      );
+    }
+    return result.insertId;
+  });
+}
+
+const MLS_ENVELOPE_SELECT = `
+  SELECT e.id, e.version, e.conversation_id AS conversationId, e.epoch, e.kind,
+         e.sender_mls_device_id AS senderMlsDeviceId, e.sequence_number AS sequenceNumber,
+         e.wall_time AS wallTime, e.logical_time AS logicalTime, e.payload, e.content_hash AS contentHash
+  FROM mls_envelopes e`;
+
+export function listMlsEnvelopes(
+  conversationId,
+  cursor = { epoch: 0, lastSequencePerDevice: new Map() },
+  limit = 500
+) {
+  const entries = [...cursor.lastSequencePerDevice.values()];
+  const params = [conversationId, cursor.epoch];
+  let sameEpoch = 'TRUE';
+  if (entries.length) {
+    const placeholders = entries.map(() => '?').join(', ');
+    sameEpoch = `(e.sender_mls_device_id NOT IN (${placeholders})`;
+    params.push(...entries.map((entry) => entry.deviceId));
+    for (const entry of entries) {
+      sameEpoch += ' OR (e.sender_mls_device_id = ? AND e.sequence_number > ?)';
+      params.push(entry.deviceId, entry.sequence);
+    }
+    sameEpoch += ')';
+  }
+  params.push(Math.min(Math.max(Number(limit) || 100, 1), 500));
+  return rows(
+    `${MLS_ENVELOPE_SELECT}
+     WHERE e.conversation_id = ?
+       AND (e.epoch > ? OR (e.epoch = ? AND ${sameEpoch}))
+     ORDER BY e.id LIMIT ?`,
+    [params[0], params[1], params[1], ...params.slice(2)]
+  );
+}
+
+export function listPendingMlsWelcomes(deviceId) {
+  return rows(
+    `${MLS_ENVELOPE_SELECT}
+     JOIN mls_envelope_recipients er ON er.envelope_id = e.id
+     JOIN mls_device_profiles dp ON dp.mls_device_id = er.mls_device_id
+     WHERE dp.device_id = ? AND er.acknowledged_at IS NULL AND e.kind = 'Welcome'
+     ORDER BY e.id`, [deviceId]
+  );
+}
+
+export async function acknowledgeMlsWelcome(envelopeId, deviceId) {
+  const [result] = await pool.query(
+    `UPDATE mls_envelope_recipients er
+     JOIN mls_device_profiles dp ON dp.mls_device_id = er.mls_device_id
+     SET er.acknowledged_at = ? WHERE er.envelope_id = ? AND dp.device_id = ?`,
+    [Date.now(), envelopeId, deviceId]
+  );
+  return result.affectedRows > 0;
+}
+
+export function findMlsDeviceByServerDevice(deviceId) {
+  return first(
+    `SELECT dp.mls_device_id AS mlsDeviceId, up.mls_user_id AS mlsUserId
+     FROM user_devices d
+     JOIN mls_device_profiles dp ON dp.device_id = d.id
+     JOIN mls_user_profiles up ON up.user_id = d.user_id
+     WHERE d.id = ?`, [deviceId]
+  );
+}
+
+export function findServerUsersForMlsDevices(mlsDeviceIds) {
+  if (!mlsDeviceIds.length) return [];
+  return rows(
+    `SELECT d.user_id AS userId, dp.mls_device_id AS mlsDeviceId FROM mls_device_profiles dp
+     JOIN user_devices d ON d.id = dp.device_id AND d.status = 'active'
+     WHERE dp.mls_device_id IN (?)`, [mlsDeviceIds]
+  );
+}
+
+export async function addMlsMessageRead(messageId, roomId, userId, username, readAt) {
+  await pool.query(
+    `INSERT IGNORE INTO mls_message_reads (message_id, room_id, user_id, username, read_at)
+     VALUES (?, ?, ?, ?, ?)`, [messageId, roomId, userId, username, readAt]
+  );
+}
+
+export function getMlsMessageReads(messageId) {
+  return rows(
+    `SELECT user_id AS userId, username, read_at AS readAt
+     FROM mls_message_reads WHERE message_id = ?`, [messageId]
+  );
 }
 
 export default pool;

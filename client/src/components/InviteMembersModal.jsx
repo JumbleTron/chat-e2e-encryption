@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { apiFetch } from '../api';
-import { inviteRoomMembers } from '../devices';
+import { inviteMlsMembers } from '../mls/client';
 
 export default function InviteMembersModal({ roomId, members, onClose, onInvited }) {
   const [users, setUsers] = useState([]);
@@ -30,7 +30,7 @@ export default function InviteMembersModal({ roomId, members, onClose, onInvited
     setLoading(true);
     setError('');
     try {
-      await inviteRoomMembers(roomId, invitedUsers);
+      await inviteMlsMembers(roomId, invitedUsers);
       onInvited();
     } catch (inviteError) {
       setError(inviteError.message);
@@ -43,14 +43,14 @@ export default function InviteMembersModal({ roomId, members, onClose, onInvited
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" onClick={(event) => event.stopPropagation()}>
         <h2>Zaproś do pokoju</h2>
-        <p className="modal-desc">Zaproszeni otrzymają dostęp do zaszyfrowanej historii pokoju.</p>
+        <p className="modal-desc">Zaproszeni otrzymają dostęp od nowej epoki MLS, bez wcześniejszej historii.</p>
         <form onSubmit={submit}>
           {users.length > 0 ? <fieldset className="member-picker invite-picker">
             <legend>Użytkownicy</legend>
             {users.map((user) => <label key={user.id}>
               <input
                 type="checkbox" checked={selected.has(user.id)}
-                onChange={() => toggleUser(user.id)} disabled={user.devices.length === 0}
+                onChange={() => toggleUser(user.id)} disabled={user.devices.length === 0 || !user.mlsUserId}
               />
               <span>{user.username}</span>
               <small>{user.devices.length} urz.</small>
