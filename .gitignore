@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.DS_Store
+.idea/
+.vscode/
+*.log
+.env
+.env.*
+!.env.example
+server/data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+coverage/
+.nyc_output/

@@ -1,0 +1,37 @@
+name: Bug report
+description: Zgłoś powtarzalny błąd niezwiązany z poufną podatnością.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Podatności zgłaszaj prywatnie zgodnie z SECURITY.md.
+  - type: textarea
+    id: description
+    attributes:
+      label: Opis
+      description: Co się stało i jakiego zachowania oczekiwano?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Kroki reprodukcji
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Wersja lub commit
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Środowisko
+      description: System, przeglądarka, Node, Docker i istotna konfiguracja bez sekretów.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logi
+      render: shell

@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: message_app_test
+          MYSQL_USER: message_app
+          MYSQL_PASSWORD: test-password
+          MYSQL_ROOT_PASSWORD: root-test-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot-test-password --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            client/package-lock.json
+            server/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix client ci
+          npm --prefix server ci
+
+      - name: Static checks and frontend build
+        run: npm run check
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Start backend
+        env:
+          PORT: 3001
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_NAME: message_app_test
+          DB_USER: message_app
+          DB_PASSWORD: test-password
+          CLIENT_ORIGIN: '*'
+        run: |
+          npm --prefix server start > /tmp/message-app-server.log 2>&1 &
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:3001/api/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/message-app-server.log
+          exit 1
+
+      - name: Integration test
+        env:
+          TEST_ORIGIN: http://127.0.0.1:3001
+        run: npm run test:integration
+
+      - name: Backend logs on failure
+        if: failure()
+        run: cat /tmp/message-app-server.log || true

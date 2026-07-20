@@ -1,0 +1,25 @@
+name: Feature request
+description: Zaproponuj zmianę zachowania lub nową funkcję.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem użytkownika
+      description: Jaki konkretny problem ma rozwiązać funkcja?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proponowane rozwiązanie
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Wpływ na bezpieczeństwo i prywatność
+      description: Jak zmieniają się klucze, metadane, uprawnienia lub model zagrożeń?
+    validations:
+      required: true

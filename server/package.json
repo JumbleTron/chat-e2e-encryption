@@ -1,0 +1,25 @@
+{
+  "name": "message-app-server",
+  "version": "1.0.0",
+  "description": "MySQL and Socket.IO backend for Secure Group Chat",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file-if-exists=../.env index.js",
+    "start": "node index.js",
+    "test:integration": "node tests/integration.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "mysql2": "^3.23.1",
+    "socket.io": "^4.8.1",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.3"
+  }
+}

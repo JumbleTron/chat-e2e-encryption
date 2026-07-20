@@ -1,0 +1,7 @@
+services:
+  mysql:
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+  server:
+    ports:
+      - "${API_PORT:-3001}:3001"
